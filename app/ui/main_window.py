@@ -1,4 +1,5 @@
 from __future__ import annotations
+from app.ui.backtest_lab_page import BacktestLabPage
 
 import sys
 
@@ -89,10 +90,8 @@ class MainWindow(QMainWindow):
             "Strategy Lab",
             "Strategy generation comes after the Backtest Engine.",
         )
-        self.backtest_page = PlaceholderPage(
-            "Backtest Lab",
-            "Backtest engine is the next major build after Feature Lab.",
-        )
+        self.backtest_page = BacktestLabPage()
+
         self.validation_page = PlaceholderPage(
             "Validation Lab",
             "Forward test, walk-forward, Monte Carlo, and overfit checks come later.",
@@ -141,6 +140,9 @@ class MainWindow(QMainWindow):
         self.chart_page.timeframe_requested.connect(self.build_timeframe_async)
         self.feature_page.timeframe_requested.connect(self.build_timeframe_async)
         self.feature_page.log_message.connect(self.log_panel.append)
+	
+	self.backtest_page.timeframe_requested.connect(self.build_timeframe_async)
+	self.backtest_page.log_message.connect(self.log_panel.append)
 
     def _build_menu(self):
         menubar = self.menuBar()
@@ -167,6 +169,7 @@ class MainWindow(QMainWindow):
 
         self.chart_page.set_base_dataset(df)
         self.feature_page.set_source_context(self.source_path, self.tf_cache)
+	self.backtest_page.set_source_context(self.source_path, self.tf_cache)
         self.ai_page.set_dataframe(df)
 
         self.log_panel.append(
@@ -238,6 +241,7 @@ class MainWindow(QMainWindow):
         self.tf_cache[timeframe] = df
         self.chart_page.set_timeframe_dataset(timeframe, df)
         self.feature_page.set_timeframe_dataset(timeframe, df)
+	self.backtest_page.set_timeframe_dataset(timeframe, df)
 
         self.data_page.progress.setValue(100)
         self.data_page.stage_label.setText(f"Stage: timeframe ready [{timeframe}]")
