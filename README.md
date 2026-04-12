@@ -1,24 +1,28 @@
-# Crypto Strategy Lab V9 Feature Lab
+# Crypto Strategy Lab
 
-Desktop build with:
-- optimized large-dataset loading
-- disk-cached timeframes
-- chart workspace
-- Feature Lab with real feature generation
-- exportable feature datasets
-- Strategy Lab candidate generation and scoring
-- Backtest Lab with realistic fills/fees/slippage
-- Validation Lab walk-forward stability scoring
-- AI Lab with regime classification, setup confidence scoring, and training curves
-- AI Lab automated Start pipeline (profile -> features -> evolution -> validation -> AI -> TradingView package)
-- Extended AI Lab sweeps: up to 200 generations, larger populations, and wider per-generation variant exploration
-- AI Lab Live Monitor window for real-time candidate testing and evolution visibility
-- Neural Network Training window with topology visualization, live epoch chips, and pipeline generation/candidate context
-- Expanded indicator set (VWAP, Momentum, Order Flow, Z-Score, Donchian, Stochastic, Keltner, ADX, CCI, Williams %R, OBV, CMF, Ichimoku, Supertrend, Fractal, Microstructure)
+Crypto Strategy Lab is now launched through a **PySide6 + QML (Qt Quick Controls 2)** shell focused on a premium desktop workspace layout.
+
+## UI Architecture (QML-first)
+- Left navigation rail (Home, Data, Strategy, Evolution, Neural, Backtest, Results, Export)
+- Top command bar (project, dataset, timeframe, Start/Pause/Stop, model state)
+- Main tab workspace (Overview, Strategies, Evolution, Neural, Results)
+- Right inspector panel (selected strategy details + copy action)
+- Bottom collapsible log console
+
+## Included Reusable QML Components
+- `NavigationRail`
+- `TopBar`
+- `StrategyItem`
+- `ChartPanel`
+- `InspectorPanel`
+- `LogConsole`
 
 ## Run
+```bash
 pip install -r requirements.txt
 python main.py
+```
 
-## Manual
-See `docs/MANUAL.md` for a step-by-step operating guide.
+## Notes
+- The QML UI is designed to be responsive, scrollable, and visually clean.
+- Real-time demo activity is powered by `AppState` (`app/ui/qml_app.py`) so charts, strategy feed, and logs update live.
