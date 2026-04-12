@@ -33,6 +33,7 @@ class AutoResearchWorker(QObject):
     strategy_event = pyqtSignal(object)
     mutation_event = pyqtSignal(object)
     lifecycle_event = pyqtSignal(object)
+    evolution_diag = pyqtSignal(object)
     ai_epoch = pyqtSignal(int, int, float, float, object)
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
@@ -93,6 +94,8 @@ class AutoResearchWorker(QObject):
             all_generations = []
             best_rows = []
             seed_pool: list[dict] = []
+            best_fitness_so_far = -1e18
+            stagnation_count = 0
             template_map = {t.key: t for t in TEMPLATES}
             current_df = featured_df
             if "synthetic" in current_df.columns:
@@ -122,12 +125,17 @@ class AutoResearchWorker(QObject):
                     self.candidate_test.emit(gen, done, total, family)
                     self._checkpoint()
 
+                exploration_strength = 0.0
+                if stagnation_count >= 2:
+                    exploration_strength = min(0.8, 0.25 + 0.15 * (stagnation_count - 1))
+                    self.log.emit("WARN", f"[AI][GEN {gen}] Stagnation detected ({stagnation_count}), forcing exploration strength={exploration_strength:.2f}")
                 all_variants, top_variants = evolve_templates(
                     current_df,
                     top_k=self.config.population_top_k,
                     progress_cb=_variant_progress,
                     seed_pool=seed_pool,
                     max_variants=self.config.max_variants_per_generation,
+                    exploration_strength=exploration_strength,
                 )
                 best = top_variants.iloc[0]
                 survivors_keys = set(
@@ -166,6 +174,9 @@ class AutoResearchWorker(QObject):
                         "validation_score": float(row["robustness_score"]),
                         "status": status,
                         "tradingview_ready": "Yes",
+                        "origin": str(row.get("origin", "random")),
+                        "mutation_type": str(row.get("mutation_type", "base")),
+                        "parent_strategy_id": str(row.get("parent_id", "none")),
                         "metrics": {
                             "return_pct": float(row["test_return_pct"]),
                             "drawdown_pct": float(row["test_max_drawdown_pct"]),
@@ -209,8 +220,32 @@ class AutoResearchWorker(QObject):
                 )
 
                 fitness = float(best["fitness"])
+                if fitness > best_fitness_so_far + 0.05:
+                    best_fitness_so_far = fitness
+                    stagnation_count = 0
+                else:
+                    stagnation_count += 1
                 survivors = int(len(top_variants))
                 population = int(len(all_variants))
+                logic_div = float(all_variants["template_key"].nunique()) / max(1, population)
+                param_div = float(all_variants["structure_sig"].nunique()) / max(1, population)
+                indicator_div = logic_div
+                diversity_score = round((logic_div * 0.45 + param_div * 0.45 + indicator_div * 0.10) * 100.0, 2)
+                mutation_dist = all_variants["mutation_type"].value_counts().to_dict() if "mutation_type" in all_variants.columns else {}
+                crossover_usage = int((all_variants.get("origin", pd.Series(dtype=str)) == "crossover").sum()) if "origin" in all_variants.columns else 0
+                self.evolution_diag.emit(
+                    {
+                        "generation": gen,
+                        "diversity_score": diversity_score,
+                        "logic_diversity": round(logic_div * 100.0, 2),
+                        "parameter_diversity": round(param_div * 100.0, 2),
+                        "mutation_distribution": mutation_dist,
+                        "crossover_usage": crossover_usage,
+                        "stagnation_count": stagnation_count,
+                        "exploration_strength": exploration_strength,
+                        "exploration_vs_exploitation": round(exploration_strength / max(0.01, 1 - exploration_strength), 2) if exploration_strength > 0 else 0.0,
+                    }
+                )
 
                 record = {
                     "generation": gen,

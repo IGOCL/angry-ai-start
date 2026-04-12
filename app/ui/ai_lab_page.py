@@ -193,11 +193,15 @@ class AILabPage(QWidget):
         self.mutation_box = QPlainTextEdit()
         self.mutation_box.setReadOnly(True)
         self.mutation_box.setPlaceholderText("Mutation inspector waiting...")
+        self.evolution_diag_box = QPlainTextEdit()
+        self.evolution_diag_box.setReadOnly(True)
+        self.evolution_diag_box.setPlaceholderText("Evolution diagnostics waiting...")
 
-        self.strategy_feed = QTableWidget(0, 15)
+        self.strategy_feed = QTableWidget(0, 18)
         self.strategy_feed.setHorizontalHeaderLabels([
             "ID", "Gen", "Name", "Type", "Timeframe", "Indicators", "Parameters",
-            "Entry", "Exit", "Filters", "Fitness", "Robustness", "Validation", "Status", "TV"
+            "Entry", "Exit", "Filters", "Fitness", "Robustness", "Validation", "Status", "TV",
+            "Origin", "Mutation", "Parent"
         ])
         self.strategy_feed.itemSelectionChanged.connect(self._on_strategy_selected)
         self.strategy_feed.verticalHeader().setVisible(False)
@@ -237,6 +241,8 @@ class AILabPage(QWidget):
         fr.addWidget(self.lifecycle_table, 1)
         fr.addWidget(QLabel("Strategy DNA / Mutation Inspector"))
         fr.addWidget(self.mutation_box, 2)
+        fr.addWidget(QLabel("Evolution Diagnostics"))
+        fr.addWidget(self.evolution_diag_box, 2)
         feed_split.addWidget(feed_left)
         feed_split.addWidget(feed_right)
         feed_split.setStretchFactor(0, 3)
@@ -440,6 +446,7 @@ class AILabPage(QWidget):
         self.pipeline_worker.strategy_event.connect(self._on_strategy_event)
         self.pipeline_worker.lifecycle_event.connect(self._on_lifecycle_event)
         self.pipeline_worker.mutation_event.connect(self._on_mutation_event)
+        self.pipeline_worker.evolution_diag.connect(self._on_evolution_diag)
         self.pipeline_worker.finished.connect(self._on_pipeline_finished)
         self.pipeline_worker.error.connect(self._on_pipeline_error)
 
@@ -662,6 +669,7 @@ class AILabPage(QWidget):
         self.strategy_feed.setRowCount(0)
         self.strategy_text.clear()
         self.mutation_box.clear()
+        self.evolution_diag_box.clear()
         self.lifecycle_table.setRowCount(0)
         if self.nn_window is not None:
             self.nn_window.reset_run()
@@ -673,7 +681,8 @@ class AILabPage(QWidget):
         vals = [
             ev["strategy_id"], ev["generation"], ev["name"], ev["type"], ev["timeframe"],
             ev["indicators"], str(ev["parameters"]), ev["entry_logic"], ev["exit_logic"], ev["filters"],
-            f"{ev['fitness']:.2f}", f"{ev['robustness']:.2f}", f"{ev['validation_score']:.2f}", ev["status"], ev["tradingview_ready"]
+            f"{ev['fitness']:.2f}", f"{ev['robustness']:.2f}", f"{ev['validation_score']:.2f}", ev["status"], ev["tradingview_ready"],
+            ev.get("origin", "random"), ev.get("mutation_type", "base"), ev.get("parent_strategy_id", "none")
         ]
         for c, v in enumerate(vals):
             self.strategy_feed.setItem(r, c, QTableWidgetItem(str(v)))
@@ -699,6 +708,24 @@ class AILabPage(QWidget):
                 f"Fitness Δ: {mutation.get('fitness_delta', 0.0):.2f}",
                 f"Robustness Δ: {mutation.get('robustness_delta', 0.0):.2f}",
             ])
+        )
+
+    def _on_evolution_diag(self, diag: dict):
+        self.evolution_diag_box.setPlainText(
+            "\n".join(
+                [
+                    f"Generation: {diag.get('generation')}",
+                    f"Diversity Score: {diag.get('diversity_score', 0.0):.2f}",
+                    f"Logic Diversity: {diag.get('logic_diversity', 0.0):.2f}",
+                    f"Parameter Diversity: {diag.get('parameter_diversity', 0.0):.2f}",
+                    f"Crossover Usage: {diag.get('crossover_usage', 0)}",
+                    f"Stagnation Count: {diag.get('stagnation_count', 0)}",
+                    f"Exploration Strength: {diag.get('exploration_strength', 0.0):.2f}",
+                    f"Explore/Exploit Ratio: {diag.get('exploration_vs_exploitation', 0.0):.2f}",
+                    "Mutation Distribution:",
+                    *[f"- {k}: {v}" for k, v in dict(diag.get("mutation_distribution", {})).items()],
+                ]
+            )
         )
 
     def _selected_strategy_row(self) -> dict | None:

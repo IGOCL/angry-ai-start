@@ -636,6 +636,16 @@ def _mutate_param_variants(template_key: str, params: dict[str, Any], rng: np.ra
     return out
 
 
+def _param_signature(template_key: str, params: dict[str, Any]) -> str:
+    bits = [template_key]
+    for k in sorted(params.keys()):
+        v = params[k]
+        if isinstance(v, float):
+            v = round(v, 3)
+        bits.append(f"{k}={v}")
+    return "|".join(bits)
+
+
 def evolve_templates(
     df: pd.DataFrame,
     config: BacktestConfig | None = None,
@@ -643,12 +653,13 @@ def evolve_templates(
     progress_cb=None,
     seed_pool: list[dict[str, Any]] | None = None,
     max_variants: int = 500,
+    exploration_strength: float = 0.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     cfg = config or BacktestConfig()
     all_rows: list[dict[str, Any]] = []
     rng = np.random.default_rng(42 + len(df) + top_k)
 
-    grids = [(t, p) for t in TEMPLATES for p in _variant_param_grid(t.key, t.params)]
+    grids = [{"template": t, "params": p, "origin": "random", "mutation_type": "base", "parent_id": "none"} for t in TEMPLATES for p in _variant_param_grid(t.key, t.params)]
     if seed_pool:
         template_map = {t.key: t for t in TEMPLATES}
         for seed in seed_pool:
@@ -657,14 +668,50 @@ def evolve_templates(
             t = template_map.get(key)
             if t is None:
                 continue
-            grids.append((t, params))
-            for mp in _mutate_param_variants(key, params, rng=rng, n=20):
-                grids.append((t, mp))
+            pid = str(seed.get("strategy_id", "seed"))
+            grids.append({"template": t, "params": params, "origin": "mutation", "mutation_type": "elite_seed", "parent_id": pid})
+            for tier, n_mut in [("minor", 8), ("medium", 8), ("major", 4)]:
+                for mp in _mutate_param_variants(key, params, rng=rng, n=n_mut + int(8 * exploration_strength)):
+                    mt = tier
+                    tt = t
+                    if tier == "major" and rng.random() < 0.35:
+                        tt = TEMPLATES[int(rng.integers(0, len(TEMPLATES)))]
+                        mp = dict(_variant_param_grid(tt.key, tt.params)[int(rng.integers(0, max(1, len(_variant_param_grid(tt.key, tt.params)))) )])
+                        mt = "major_logic_swap"
+                    grids.append({"template": tt, "params": mp, "origin": "mutation", "mutation_type": mt, "parent_id": pid})
+        if len(seed_pool) >= 2:
+            for _ in range(24):
+                pa = seed_pool[int(rng.integers(0, len(seed_pool)))]
+                pb = seed_pool[int(rng.integers(0, len(seed_pool)))]
+                ta = template_map.get(str(pa.get("template_key", "")), TEMPLATES[0])
+                source_a = dict(pa.get("params", {}))
+                source_b = dict(pb.get("params", {}))
+                child = {}
+                keys = sorted(set(source_a.keys()) | set(source_b.keys()))
+                for k in keys:
+                    child[k] = source_a.get(k, source_b.get(k)) if rng.random() < 0.5 else source_b.get(k, source_a.get(k))
+                grids.append(
+                    {
+                        "template": ta,
+                        "params": child or dict(ta.params),
+                        "origin": "crossover",
+                        "mutation_type": "recombine",
+                        "parent_id": f"{pa.get('strategy_id', 'A')}+{pb.get('strategy_id', 'B')}",
+                    }
+                )
 
-    dedup: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[StrategyTemplate, dict[str, Any]]] = {}
-    for t, p in grids:
-        key = (t.key, tuple(sorted((str(k), str(v)) for k, v in p.items())))
-        dedup[key] = (t, p)
+    if exploration_strength > 0:
+        extra = int(max_variants * min(0.7, 0.25 + exploration_strength))
+        for _ in range(extra):
+            tt = TEMPLATES[int(rng.integers(0, len(TEMPLATES)))]
+            pv = _variant_param_grid(tt.key, tt.params)
+            pp = dict(pv[int(rng.integers(0, max(1, len(pv))))])
+            grids.append({"template": tt, "params": pp, "origin": "random", "mutation_type": "explore_inject", "parent_id": "none"})
+
+    dedup: dict[str, dict[str, Any]] = {}
+    for g in grids:
+        key = _param_signature(g["template"].key, g["params"])
+        dedup[key] = g
     grids = list(dedup.values())
     if max_variants > 0 and len(grids) > max_variants:
         idxs = np.linspace(0, len(grids) - 1, num=max_variants, dtype=int).tolist()
@@ -672,7 +719,9 @@ def evolve_templates(
 
     total = max(1, len(grids))
 
-    for idx, (t, params) in enumerate(grids, start=1):
+    for idx, g in enumerate(grids, start=1):
+        t = g["template"]
+        params = g["params"]
         if progress_cb is not None and (idx == 1 or idx % 3 == 0 or idx == total):
             try:
                 progress_cb(idx, total, t.name)
@@ -687,6 +736,9 @@ def evolve_templates(
                     "strategy": t.name,
                     "template_key": t.key,
                     "params": evaluated["params"],
+                    "origin": g.get("origin", "random"),
+                    "mutation_type": g.get("mutation_type", "base"),
+                    "parent_id": g.get("parent_id", "none"),
                     "complexity_score": complexity_score,
                     "robustness_score": float(evaluated["robustness_score"]),
                     "test_return_pct": float(test["total_return_pct"]),
@@ -702,12 +754,19 @@ def evolve_templates(
         raise ValueError("Evolution engine could not evaluate any template variants")
 
     frame = pd.DataFrame(all_rows)
+    frame["structure_sig"] = frame.apply(lambda r: _param_signature(str(r["template_key"]), dict(r["params"])), axis=1)
+    dup_counts = frame["structure_sig"].value_counts()
+    fam_counts = frame["template_key"].value_counts()
+    frame["dup_penalty"] = frame["structure_sig"].map(lambda s: max(0.0, float(dup_counts.get(s, 1) - 1) * 1.6))
+    frame["family_penalty"] = frame["template_key"].map(lambda k: max(0.0, float(fam_counts.get(k, 1) / max(1, len(frame)) * 10.0)))
     frame["fitness"] = (
         frame["robustness_score"] * 0.50 +
         frame["test_return_pct"] * 0.30 +
         frame["test_win_rate_pct"] * 0.10 -
         frame["test_max_drawdown_pct"].abs() * 0.10 +
-        frame["complexity_score"] * 0.05
+        frame["complexity_score"] * 0.05 -
+        frame["dup_penalty"] -
+        frame["family_penalty"]
     )
     frame = frame.sort_values("fitness", ascending=False).reset_index(drop=True)
     top = frame.head(max(1, int(top_k))).reset_index(drop=True)
