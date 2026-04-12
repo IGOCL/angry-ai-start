@@ -32,7 +32,10 @@ ApplicationWindow {
             id: nav
             Layout.fillHeight: true
             currentIndex: root.navIndex
-            onIndexChanged: function(i) { root.navIndex = i }
+            onIndexChanged: function(i) {
+                root.navIndex = i
+                tabBar.currentIndex = Math.min(i, tabBar.count - 1)
+            }
         }
 
         ColumnLayout {
@@ -68,11 +71,14 @@ ApplicationWindow {
                             id: tabBar
                             Layout.fillWidth: true
                             background: Rectangle { color: "#0D1523"; radius: 10 }
-                            TabButton { text: "Overview" }
+                            TabButton { text: "Home" }
+                            TabButton { text: "Data" }
                             TabButton { text: "Strategies" }
                             TabButton { text: "Evolution" }
                             TabButton { text: "Neural" }
+                            TabButton { text: "Backtest" }
                             TabButton { text: "Results" }
+                            TabButton { text: "Export" }
                         }
 
                         StackLayout {
@@ -80,10 +86,13 @@ ApplicationWindow {
                             Layout.fillHeight: true
                             currentIndex: tabBar.currentIndex
                             OverviewView {}
+                            DataView {}
                             StrategyView {}
                             EvolutionView {}
                             NeuralView {}
+                            BacktestView {}
                             ResultsView {}
+                            ExportView {}
                         }
                     }
                 }

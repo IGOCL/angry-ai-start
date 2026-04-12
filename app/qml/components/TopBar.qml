@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Dialogs
 
 Rectangle {
     id: root
@@ -12,6 +13,16 @@ Rectangle {
     signal startClicked()
     signal pauseClicked()
     signal stopClicked()
+
+    FileDialog {
+        id: fileDialog
+        title: "Select market dataset"
+        nameFilters: ["Data files (*.parquet *.pq *.csv)", "All files (*)"]
+        onAccepted: {
+            datasetPath.text = selectedFile.toString().replace("file:///", "")
+            appState.setDatasetPath(datasetPath.text)
+        }
+    }
 
     RowLayout {
         anchors.fill: parent
@@ -29,6 +40,7 @@ Rectangle {
             onEditingFinished: appState.setDatasetPath(text)
         }
 
+        Button { text: "Browse"; onClicked: fileDialog.open() }
         ComboBox { model: ["1m", "5m", "15m", "1h"]; currentIndex: 0; Layout.preferredWidth: 90 }
 
         Button { text: "Start"; onClicked: { appState.setDatasetPath(datasetPath.text); root.startClicked() } }

@@ -183,6 +183,7 @@ class AppState(QObject):
     stageTextChanged = Signal()
     regimeCountsChanged = Signal()
     featureImportanceChanged = Signal()
+    profileChanged = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -199,6 +200,7 @@ class AppState(QObject):
         self._model_status = "idle"
         self._dataset_path = ""
         self._stage_text = "Idle"
+        self._profile: dict = {}
 
         self._thread: QThread | None = None
         self._worker: ResearchWorker | None = None
@@ -243,6 +245,11 @@ class AppState(QObject):
     def featureImportance(self):
         return self._feature_importance
 
+
+    @Property("QVariantMap", notify=profileChanged)
+    def profile(self):
+        return self._profile
+
     @Property(str, notify=modelStatusChanged)
     def modelStatus(self):
         return self._model_status
@@ -274,6 +281,7 @@ class AppState(QObject):
         self._val_accuracy_series = []
         self._regime_counts = {}
         self._feature_importance = {}
+        self._profile = {}
         self.strategiesChanged.emit()
         self.selectedStrategyChanged.emit()
         self.fitnessSeriesChanged.emit()
@@ -281,6 +289,7 @@ class AppState(QObject):
         self.accuracySeriesChanged.emit()
         self.valLossSeriesChanged.emit()
         self.valAccuracySeriesChanged.emit()
+        self.profileChanged.emit()
 
         self._model_status = "running"
         self.modelStatusChanged.emit()
@@ -387,6 +396,9 @@ class AppState(QObject):
         self._model_status = "completed"
         self.modelStatusChanged.emit()
         self._set_stage("Completed")
+
+        self._profile = dict(data.get("profile", {}))
+        self.profileChanged.emit()
 
         self._fitness_series = list(data.get("fitness_series", []))
         self.fitnessSeriesChanged.emit()
