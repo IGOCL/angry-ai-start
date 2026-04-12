@@ -74,6 +74,35 @@ TEMPLATES: list[StrategyTemplate] = [
         exit_logic="Exit via SL/TP/end-of-data in current phase.",
         filters="Synthetic rows do not trigger entries.",
     ),
+    StrategyTemplate(
+        key="adaptive_indicator_mesh",
+        name="Adaptive Indicator Mesh",
+        indicators=["EMA", "RSI", "MACD", "ADX", "VWAP", "Bollinger", "Stoch", "CCI", "Williams %R", "CMF", "OBV"],
+        params={
+            "ema_fast": 12,
+            "ema_slow": 55,
+            "rsi_len": 14,
+            "rsi_long_min": 54,
+            "rsi_short_max": 46,
+            "adx_min": 18,
+            "vol_spike_mult": 1.15,
+            "bb_len": 20,
+            "stoch_len": 14,
+            "cci_len": 20,
+            "williams_len": 14,
+            "cmf_len": 20,
+            "use_vwap": 1,
+            "use_bbands": 1,
+            "use_stoch": 1,
+            "use_cci": 1,
+            "use_williams": 1,
+            "use_cmf": 1,
+            "use_obv": 1,
+        },
+        entry_logic="Weighted multi-indicator voting with adaptive thresholds; requires minimum votes from enabled indicators.",
+        exit_logic="Exit via SL/TP/end-of-data in current phase.",
+        filters="Synthetic rows do not trigger entries.",
+    ),
 ]
 
 
@@ -237,6 +266,116 @@ def build_strategy_dataframe(df: pd.DataFrame, template_key: str, params: dict[s
 
         local["long_entry"] = trend_up & momentum_up & (local["rsi"] >= rsi_long_min) & strong & vwap_up & local["volume_spike"]
         local["short_entry"] = trend_dn & momentum_dn & (local["rsi"] <= rsi_short_max) & strong & vwap_dn & local["volume_spike"]
+    elif template_key == "adaptive_indicator_mesh":
+        ema_fast = int(p.get("ema_fast", 12))
+        ema_slow = int(p.get("ema_slow", 55))
+        rsi_len = int(p.get("rsi_len", 14))
+        rsi_long_min = float(p.get("rsi_long_min", 54))
+        rsi_short_max = float(p.get("rsi_short_max", 46))
+        adx_min = float(p.get("adx_min", 18))
+        vol_spike_mult = float(p.get("vol_spike_mult", 1.15))
+        bb_len = int(p.get("bb_len", 20))
+        stoch_len = int(p.get("stoch_len", 14))
+        cci_len = int(p.get("cci_len", 20))
+        williams_len = int(p.get("williams_len", 14))
+        cmf_len = int(p.get("cmf_len", 20))
+        use_vwap = int(p.get("use_vwap", 1))
+        use_bbands = int(p.get("use_bbands", 1))
+        use_stoch = int(p.get("use_stoch", 1))
+        use_cci = int(p.get("use_cci", 1))
+        use_williams = int(p.get("use_williams", 1))
+        use_cmf = int(p.get("use_cmf", 1))
+        use_obv = int(p.get("use_obv", 1))
+        if ema_fast <= 1 or ema_slow <= 2 or ema_fast >= ema_slow:
+            raise ValueError("adaptive_indicator_mesh EMA parameters invalid")
+
+        local = _ensure_vwap(local)
+        local["ema_fast"] = local["close"].ewm(span=ema_fast, adjust=False).mean()
+        local["ema_slow"] = local["close"].ewm(span=ema_slow, adjust=False).mean()
+        delta = local["close"].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(rsi_len).mean()
+        avg_loss = loss.rolling(rsi_len).mean().replace(0, pd.NA)
+        local["rsi"] = 100 - (100 / (1 + (avg_gain / avg_loss)))
+
+        macd_fast = local["close"].ewm(span=12, adjust=False).mean()
+        macd_slow = local["close"].ewm(span=26, adjust=False).mean()
+        local["macd_line"] = macd_fast - macd_slow
+        local["macd_signal"] = local["macd_line"].ewm(span=9, adjust=False).mean()
+        local["macd_hist"] = local["macd_line"] - local["macd_signal"]
+
+        plus_dm = (local["high"].diff()).clip(lower=0)
+        minus_dm = (-local["low"].diff()).clip(lower=0)
+        plus_dm[plus_dm < minus_dm] = 0
+        minus_dm[minus_dm < plus_dm] = 0
+        tr = pd.concat([(local["high"] - local["low"]), (local["high"] - local["close"].shift(1)).abs(), (local["low"] - local["close"].shift(1)).abs()], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1 / 14, adjust=False).mean().replace(0, pd.NA)
+        plus_di = 100 * (plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr)
+        minus_di = 100 * (minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)
+        local["adx_14"] = dx.ewm(alpha=1 / 14, adjust=False).mean()
+
+        vol_ma = local["volume"].rolling(50).mean()
+        local["volume_spike"] = local["volume"] > (vol_ma * vol_spike_mult)
+
+        # Optional indicator blocks
+        bb_mid = local["close"].rolling(bb_len).mean()
+        bb_std = local["close"].rolling(bb_len).std(ddof=0)
+        bb_upper = bb_mid + 2 * bb_std
+        bb_lower = bb_mid - 2 * bb_std
+
+        stoch_low = local["low"].rolling(stoch_len).min()
+        stoch_high = local["high"].rolling(stoch_len).max()
+        stoch_k = ((local["close"] - stoch_low) / (stoch_high - stoch_low).replace(0, pd.NA)) * 100.0
+
+        tp = (local["high"] + local["low"] + local["close"]) / 3.0
+        cci_ma = tp.rolling(cci_len).mean()
+        cci_md = (tp - cci_ma).abs().rolling(cci_len).mean().replace(0, pd.NA)
+        cci = (tp - cci_ma) / (0.015 * cci_md)
+
+        will_hh = local["high"].rolling(williams_len).max()
+        will_ll = local["low"].rolling(williams_len).min()
+        willr = -100 * ((will_hh - local["close"]) / (will_hh - will_ll).replace(0, pd.NA))
+
+        mfm = ((local["close"] - local["low"]) - (local["high"] - local["close"])) / (local["high"] - local["low"]).replace(0, pd.NA)
+        cmf = (mfm * local["volume"]).rolling(cmf_len).sum() / local["volume"].rolling(cmf_len).sum().replace(0, pd.NA)
+
+        obv = (np.sign(local["close"].diff().fillna(0)) * local["volume"]).cumsum()
+        obv_up = obv > obv.ewm(span=21, adjust=False).mean()
+
+        long_votes = (
+            (local["ema_fast"] > local["ema_slow"]).astype(int)
+            + (local["macd_hist"] > 0).astype(int)
+            + (local["rsi"] >= rsi_long_min).astype(int)
+            + (local["adx_14"] >= adx_min).astype(int)
+            + (local["volume_spike"]).astype(int)
+            + (use_vwap * (local["close"] > local["vwap"]).astype(int))
+            + (use_bbands * (local["close"] <= bb_upper).astype(int))
+            + (use_stoch * (stoch_k > 55).astype(int))
+            + (use_cci * (cci > 0).astype(int))
+            + (use_williams * (willr > -50).astype(int))
+            + (use_cmf * (cmf > 0).astype(int))
+            + (use_obv * obv_up.astype(int))
+        )
+        short_votes = (
+            (local["ema_fast"] < local["ema_slow"]).astype(int)
+            + (local["macd_hist"] < 0).astype(int)
+            + (local["rsi"] <= rsi_short_max).astype(int)
+            + (local["adx_14"] >= adx_min).astype(int)
+            + (local["volume_spike"]).astype(int)
+            + (use_vwap * (local["close"] < local["vwap"]).astype(int))
+            + (use_bbands * (local["close"] >= bb_lower).astype(int))
+            + (use_stoch * (stoch_k < 45).astype(int))
+            + (use_cci * (cci < 0).astype(int))
+            + (use_williams * (willr < -50).astype(int))
+            + (use_cmf * (cmf < 0).astype(int))
+            + (use_obv * (~obv_up).astype(int))
+        )
+        enabled_optional = use_vwap + use_bbands + use_stoch + use_cci + use_williams + use_cmf + use_obv
+        min_votes = max(5, 4 + int(enabled_optional * 0.6))
+        local["long_entry"] = long_votes >= min_votes
+        local["short_entry"] = short_votes >= min_votes
 
     else:
         raise ValueError(f"Unsupported template: {template_key}")
@@ -391,6 +530,36 @@ def _variant_param_grid(template_key: str, base_params: dict[str, Any]) -> list[
                                         "vol_spike_mult": vsm,
                                     }
                                 )
+    elif template_key == "adaptive_indicator_mesh":
+        for ema_fast in [8, 12, 20]:
+            for ema_slow in [34, 55, 89]:
+                if ema_fast >= ema_slow:
+                    continue
+                for rsi_len in [10, 14]:
+                    for adx_min in [14, 18, 24]:
+                        for vol_spike_mult in [1.0, 1.15, 1.35]:
+                            for feature_pack in [
+                                {"use_vwap": 1, "use_bbands": 1, "use_stoch": 1, "use_cci": 1, "use_williams": 1, "use_cmf": 0, "use_obv": 1},
+                                {"use_vwap": 1, "use_bbands": 0, "use_stoch": 1, "use_cci": 1, "use_williams": 0, "use_cmf": 1, "use_obv": 1},
+                                {"use_vwap": 0, "use_bbands": 1, "use_stoch": 1, "use_cci": 0, "use_williams": 1, "use_cmf": 1, "use_obv": 1},
+                            ]:
+                                variants.append(
+                                    {
+                                        "ema_fast": ema_fast,
+                                        "ema_slow": ema_slow,
+                                        "rsi_len": rsi_len,
+                                        "rsi_long_min": 54,
+                                        "rsi_short_max": 46,
+                                        "adx_min": adx_min,
+                                        "vol_spike_mult": vol_spike_mult,
+                                        "bb_len": 20,
+                                        "stoch_len": 14,
+                                        "cci_len": 20,
+                                        "williams_len": 14,
+                                        "cmf_len": 20,
+                                        **feature_pack,
+                                    }
+                                )
     else:
         variants.append(base_params)
     return variants or [base_params]
@@ -439,6 +608,30 @@ def _mutate_param_variants(template_key: str, params: dict[str, Any], rng: np.ra
                     "vol_spike_mult": round(vsm, 3),
                 }
             )
+        elif template_key == "adaptive_indicator_mesh":
+            ema_fast = int(max(4, min(40, p.get("ema_fast", 12) + int(rng.integers(-4, 5)))))
+            ema_slow = int(max(ema_fast + 3, min(220, p.get("ema_slow", 55) + int(rng.integers(-10, 11)))))
+            p.update(
+                {
+                    "ema_fast": ema_fast,
+                    "ema_slow": ema_slow,
+                    "rsi_len": int(max(6, min(30, p.get("rsi_len", 14) + int(rng.integers(-3, 4))))),
+                    "rsi_long_min": float(max(48, min(70, p.get("rsi_long_min", 54) + int(rng.integers(-4, 5))))),
+                    "rsi_short_max": float(max(30, min(52, p.get("rsi_short_max", 46) + int(rng.integers(-4, 5))))),
+                    "adx_min": float(max(10, min(40, p.get("adx_min", 18) + int(rng.integers(-4, 5))))),
+                    "vol_spike_mult": round(float(max(0.8, min(2.8, p.get("vol_spike_mult", 1.15) + float(rng.normal(0, 0.14))))), 3),
+                    "use_vwap": int(rng.integers(0, 2)),
+                    "use_bbands": int(rng.integers(0, 2)),
+                    "use_stoch": int(rng.integers(0, 2)),
+                    "use_cci": int(rng.integers(0, 2)),
+                    "use_williams": int(rng.integers(0, 2)),
+                    "use_cmf": int(rng.integers(0, 2)),
+                    "use_obv": int(rng.integers(0, 2)),
+                }
+            )
+            if p["use_vwap"] + p["use_bbands"] + p["use_stoch"] + p["use_cci"] + p["use_williams"] + p["use_cmf"] + p["use_obv"] < 2:
+                p["use_vwap"] = 1
+                p["use_obv"] = 1
         out.append(p)
     return out
 
@@ -488,11 +681,13 @@ def evolve_templates(
         try:
             evaluated = evaluate_template(df, t.key, params=params, config=cfg)
             test = evaluated["test"].metrics
+            complexity_score = float(len(t.indicators)) * 1.8 + float(len(params)) * 0.35
             all_rows.append(
                 {
                     "strategy": t.name,
                     "template_key": t.key,
                     "params": evaluated["params"],
+                    "complexity_score": complexity_score,
                     "robustness_score": float(evaluated["robustness_score"]),
                     "test_return_pct": float(test["total_return_pct"]),
                     "test_win_rate_pct": float(test["win_rate_pct"]),
@@ -511,7 +706,8 @@ def evolve_templates(
         frame["robustness_score"] * 0.50 +
         frame["test_return_pct"] * 0.30 +
         frame["test_win_rate_pct"] * 0.10 -
-        frame["test_max_drawdown_pct"].abs() * 0.10
+        frame["test_max_drawdown_pct"].abs() * 0.10 +
+        frame["complexity_score"] * 0.05
     )
     frame = frame.sort_values("fitness", ascending=False).reset_index(drop=True)
     top = frame.head(max(1, int(top_k))).reset_index(drop=True)

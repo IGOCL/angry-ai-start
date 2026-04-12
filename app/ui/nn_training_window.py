@@ -93,6 +93,21 @@ class NNTrainingWindow(QDialog):
     def on_finished(self):
         self.log_box.append("Training complete.")
 
+    def reset_run(self):
+        self.loss_x.clear()
+        self.loss_y.clear()
+        self.acc_x.clear()
+        self.acc_y.clear()
+        self.current_generation = 0
+        self.candidate_note = "waiting..."
+        self.loss_plot.clear()
+        self.acc_plot.clear()
+        self.log_box.clear()
+        self.status_label.setText("Pipeline generation: waiting...")
+        self.loss_chip.setText("Latest loss: -")
+        self.acc_chip.setText("Latest acc: -")
+        self.epoch_chip.setText("Epoch: -")
+
     def _draw_topology(self, arch: str):
         self.topology_plot.clear()
         if not arch:

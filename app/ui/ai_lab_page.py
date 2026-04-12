@@ -281,6 +281,11 @@ class AILabPage(QWidget):
         self.nn_window.raise_()
         self.nn_window.activateWindow()
 
+    def _preview_architecture(self, model_type: str) -> str:
+        if model_type == "logistic":
+            return "Input(7) -> Logistic(1)"
+        return "Input(7) -> Dense(14, tanh) -> Dense(1, sigmoid)"
+
     def start_pipeline(self):
         tf = self.timeframe_box.currentText()
         df = self.timeframe_cache.get(tf)
@@ -301,6 +306,9 @@ class AILabPage(QWidget):
         self.stage_label.setText("Stage: starting automated pipeline")
         self.open_live_monitor()
         self.open_nn_window()
+        if self.nn_window is not None:
+            self.nn_window.reset_run()
+            self.nn_window.set_architecture(self._preview_architecture(self.model_box.currentText()))
 
         config = ResearchRunConfig(
             selected_features=selected,
@@ -366,6 +374,9 @@ class AILabPage(QWidget):
         self._set_buttons_running(True)
         self.ai_thread = QThread()
         self.open_nn_window()
+        if self.nn_window is not None:
+            self.nn_window.reset_run()
+            self.nn_window.set_architecture(self._preview_architecture(self.model_box.currentText()))
         self.ai_worker = AIWorker(df, model_type=self.model_box.currentText())
         self.ai_worker.moveToThread(self.ai_thread)
 
@@ -529,8 +540,4 @@ class AILabPage(QWidget):
         self.conf_table.setRowCount(0)
         self.pred_table.setRowCount(0)
         if self.nn_window is not None:
-            self.nn_window.loss_x.clear()
-            self.nn_window.loss_y.clear()
-            self.nn_window.acc_x.clear()
-            self.nn_window.acc_y.clear()
-            self.nn_window.log_box.clear()
+            self.nn_window.reset_run()
