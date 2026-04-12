@@ -35,6 +35,7 @@ Also check the timeline table and log panel for active stage updates.
 - **Pause/Resume**: pauses or resumes processing
 - **Stop**: graceful cancel request
 - **AI-Only Quick Run**: only regime/confidence model analysis
+- **Open Live Monitor**: opens a dedicated real-time run window showing candidate test progress, generation evolution, and live engine logs
 
 Settings:
 - **Timeframe**: dataset slice resolution used for run

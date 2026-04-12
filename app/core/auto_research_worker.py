@@ -27,6 +27,7 @@ class AutoResearchWorker(QObject):
     log = pyqtSignal(str, str)
     timeline = pyqtSignal(str, int, str)  # stage_name, percent, note
     generation = pyqtSignal(int, int, float, int)  # gen, survivors, best_fitness, population
+    candidate_test = pyqtSignal(int, int, int, str)  # gen, done, total, family
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
 
@@ -100,6 +101,7 @@ class AutoResearchWorker(QObject):
                 def _variant_progress(done: int, total: int, family: str):
                     pct = int((done / max(1, total)) * 100)
                     self.timeline.emit("Strategy evolution", pct, f"gen {gen}: {family} {done}/{total}")
+                    self.candidate_test.emit(gen, done, total, family)
                     self._checkpoint()
 
                 all_variants, top_variants = evolve_templates(

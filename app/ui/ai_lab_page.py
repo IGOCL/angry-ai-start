@@ -22,6 +22,7 @@ import pyqtgraph as pg
 
 from app.core.ai_worker import AIWorker
 from app.core.auto_research_worker import AutoResearchWorker, ResearchRunConfig
+from app.ui.ai_live_monitor import AILiveMonitorDialog
 
 
 FEATURE_GROUPS = [
@@ -46,6 +47,7 @@ class AILabPage(QWidget):
 
         self.ai_result = None
         self.pipeline_result = None
+        self.live_monitor = None
         self._build_ui()
 
     def _build_ui(self):
@@ -84,6 +86,8 @@ class AILabPage(QWidget):
         self.stop_btn.clicked.connect(self.stop_pipeline)
         self.ai_only_btn = QPushButton("AI-Only Quick Run")
         self.ai_only_btn.clicked.connect(self.run_ai_only)
+        self.live_btn = QPushButton("Open Live Monitor")
+        self.live_btn.clicked.connect(self.open_live_monitor)
 
         control.addWidget(QLabel("Timeframe"))
         control.addWidget(self.timeframe_box)
@@ -96,6 +100,7 @@ class AILabPage(QWidget):
         control.addWidget(self.pause_btn)
         control.addWidget(self.stop_btn)
         control.addWidget(self.ai_only_btn)
+        control.addWidget(self.live_btn)
         control.addStretch(1)
 
         feature_row = QHBoxLayout()
@@ -249,8 +254,16 @@ class AILabPage(QWidget):
     def _set_buttons_running(self, running: bool):
         self.start_btn.setEnabled(not running)
         self.ai_only_btn.setEnabled(not running)
+        self.live_btn.setEnabled(True)
         self.pause_btn.setEnabled(running)
         self.stop_btn.setEnabled(running)
+
+    def open_live_monitor(self):
+        if self.live_monitor is None:
+            self.live_monitor = AILiveMonitorDialog(self)
+        self.live_monitor.show()
+        self.live_monitor.raise_()
+        self.live_monitor.activateWindow()
 
     def start_pipeline(self):
         tf = self.timeframe_box.currentText()
@@ -270,6 +283,7 @@ class AILabPage(QWidget):
         self._reset_run_views()
         self._set_buttons_running(True)
         self.stage_label.setText("Stage: starting automated pipeline")
+        self.open_live_monitor()
 
         config = ResearchRunConfig(
             selected_features=selected,
@@ -288,8 +302,17 @@ class AILabPage(QWidget):
         self.pipeline_worker.log.connect(self.log_message.emit)
         self.pipeline_worker.timeline.connect(self._on_timeline)
         self.pipeline_worker.generation.connect(self._on_generation)
+        self.pipeline_worker.candidate_test.connect(self._on_candidate_progress)
         self.pipeline_worker.finished.connect(self._on_pipeline_finished)
         self.pipeline_worker.error.connect(self._on_pipeline_error)
+
+        if self.live_monitor is not None:
+            self.pipeline_worker.progress.connect(self.live_monitor.on_progress)
+            self.pipeline_worker.stage.connect(self.live_monitor.on_stage)
+            self.pipeline_worker.log.connect(self.live_monitor.on_log)
+            self.pipeline_worker.timeline.connect(self.live_monitor.on_timeline)
+            self.pipeline_worker.generation.connect(self.live_monitor.on_generation)
+            self.pipeline_worker.candidate_test.connect(self.live_monitor.on_candidate)
 
         self.pipeline_worker.finished.connect(self.pipeline_thread.quit)
         self.pipeline_worker.error.connect(self.pipeline_thread.quit)
@@ -357,6 +380,11 @@ class AILabPage(QWidget):
         self.generation_table.setItem(row, 5, QTableWidgetItem(f"survivors={survivors}"))
         self.generation_table.setItem(row, 6, QTableWidgetItem(f"population={population}"))
 
+    def _on_candidate_progress(self, gen: int, done: int, total: int, family: str):
+        self.stage_label.setText(
+            f"Stage: testing candidates | gen {gen} | {family} {done}/{total}"
+        )
+
     def _on_pipeline_finished(self, payload):
         self.pipeline_result = payload
         self._set_buttons_running(False)
@@ -414,6 +442,8 @@ class AILabPage(QWidget):
 
         self._refresh_summary()
         self.log_message.emit("INFO", "Automated research pipeline complete")
+        if self.live_monitor is not None:
+            self.live_monitor.on_finished()
 
     def _on_ai_only_ready(self, result):
         self.ai_result = result
