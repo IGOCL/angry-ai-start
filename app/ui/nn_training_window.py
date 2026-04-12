@@ -32,6 +32,8 @@ class NNTrainingWindow(QDialog):
         self.arch_label.setStyleSheet("font-size:15px; font-weight:700;")
         self.status_label = QLabel("Pipeline generation: waiting...")
         self.status_label.setStyleSheet("color:#8fb0d4; font-size:13px;")
+        self.sample_label = QLabel("Current sample: waiting | Prediction: n/a | Probability: n/a | Confidence: n/a")
+        self.sample_label.setStyleSheet("color:#9cc3e8; font-size:12px;")
 
         chip_row = QHBoxLayout()
         self.loss_chip = QLabel("Latest loss: -")
@@ -44,6 +46,7 @@ class NNTrainingWindow(QDialog):
 
         self.param_label = QLabel("Params: total=0 | trainable=0")
         self.param_label.setStyleSheet("color:#8fb0d4; font-size:12px;")
+        self.layer_sizes: list[int] = []
 
         self.topology_plot = pg.PlotWidget(title="NN Topology")
         self.topology_plot.setMouseEnabled(x=False, y=False)
@@ -118,6 +121,7 @@ class NNTrainingWindow(QDialog):
 
         layout.addWidget(self.arch_label)
         layout.addWidget(self.status_label)
+        layout.addWidget(self.sample_label)
         layout.addLayout(chip_row)
         layout.addWidget(tabs, 6)
         layout.addWidget(self.log_box, 2)
@@ -172,6 +176,12 @@ class NNTrainingWindow(QDialog):
         self.drift_plot.plot(self.loss_x, self.drift_y, pen=pg.mkPen("#ff8fab", width=2))
 
         confidence = float(extra.get("output_confidence", 0.0))
+        sample = str(extra.get("current_sample", "n/a"))
+        pred = str(extra.get("prediction", "n/a"))
+        prob = float(extra.get("probability", 0.0))
+        self.sample_label.setText(
+            f"Current sample: {sample} | Prediction: {pred} | Probability: {prob:.2f} | Confidence: {confidence:.2f}"
+        )
         self.output_meter.clear()
         self.output_meter.plot(self.loss_x, [confidence] * len(self.loss_x), pen=pg.mkPen("#7bffb1", width=2))
         self.output_meter.addItem(pg.InfiniteLine(pos=0.5, angle=0, pen=pg.mkPen("#555", width=1)))
@@ -187,6 +197,7 @@ class NNTrainingWindow(QDialog):
             bg = pg.BarGraphItem(x=x, height=y, width=0.7, brush="#4cc9f0")
             self.feature_bar.clear()
             self.feature_bar.addItem(bg)
+            self._draw_topology(self.arch_label.text().replace("Architecture: ", ""), layer_activity=layer_activity, feature_strength=y, output_conf=confidence)
 
         rp = float(extra.get("val_acc", 0.0))
         self.regime_plot.clear()
@@ -217,11 +228,12 @@ class NNTrainingWindow(QDialog):
         self.regime_plot.clear()
         self.log_box.clear()
         self.status_label.setText("Pipeline generation: waiting...")
+        self.sample_label.setText("Current sample: waiting | Prediction: n/a | Probability: n/a | Confidence: n/a")
         self.loss_chip.setText("Latest loss: -")
         self.acc_chip.setText("Latest acc: -")
         self.epoch_chip.setText("Epoch: -")
 
-    def _draw_topology(self, arch: str):
+    def _draw_topology(self, arch: str, layer_activity: list[float] | None = None, feature_strength=None, output_conf: float = 0.5):
         self.topology_plot.clear()
         if not arch:
             return
@@ -236,6 +248,8 @@ class NNTrainingWindow(QDialog):
                 continue
         if len(layer_sizes) < 2:
             return
+        self.layer_sizes = layer_sizes
+        layer_activity = layer_activity or [0.4] * len(layer_sizes)
 
         x_step = 1.0 / max(1, len(layer_sizes) - 1)
         layer_points: list[list[tuple[float, float]]] = []
@@ -250,23 +264,37 @@ class NNTrainingWindow(QDialog):
             left = layer_points[i]
             right = layer_points[i + 1]
             total_params += len(left) * len(right)
+            edge_weight = 1.0
+            if feature_strength is not None and i == 0 and len(feature_strength) > 0:
+                edge_weight = float(np.clip(np.mean(feature_strength), 0.2, 3.0))
             for x1, y1 in left:
                 for x2, y2 in right:
                     self.topology_plot.plot(
                         [x1, x2],
                         [y1, y2],
-                        pen=pg.mkPen(color=(70, 110, 160, 90), width=1),
+                        pen=pg.mkPen(color=(70, 110, 160, min(255, int(70 + 80 * edge_weight))), width=max(1, int(edge_weight))),
                     )
-        for pts in layer_points:
+        for li, pts in enumerate(layer_points):
             x = [p[0] for p in pts]
             y = [p[1] for p in pts]
+            act = float(np.clip(layer_activity[min(li, len(layer_activity) - 1)], 0.0, 1.2))
+            if li == len(layer_points) - 1:
+                if output_conf > 0.66:
+                    brush = (70, 250, 160, min(255, int(120 + 120 * output_conf)))
+                elif output_conf < 0.34:
+                    brush = (255, 120, 120, min(255, int(120 + 120 * (1 - output_conf))))
+                else:
+                    brush = (255, 205, 86, 190)
+            else:
+                v = min(255, int(80 + act * 160))
+                brush = (v, 220, 255, min(255, int(130 + act * 80)))
             self.topology_plot.plot(
                 x,
                 y,
                 pen=None,
                 symbol="o",
-                symbolSize=9,
-                symbolBrush=(130, 220, 255, 220),
+                symbolSize=max(7, 7 + int(act * 5)),
+                symbolBrush=brush,
                 symbolPen=pg.mkPen("#63d8ff", width=1),
             )
         self.param_label.setText(f"Params: total={total_params:,} | trainable={total_params:,}")

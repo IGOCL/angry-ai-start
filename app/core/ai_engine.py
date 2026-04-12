@@ -197,6 +197,7 @@ def _train_setup_model(
             grad_norm_curve.append(float(grad_norm))
             drift_curve.append(float(drift))
             if epoch_cb is not None:
+                sample_idx = int((epoch * 7) % max(1, len(df)))
                 epoch_cb(epoch + 1, epochs, float(loss), acc, {
                     "val_loss": float(vloss),
                     "val_acc": vacc,
@@ -209,6 +210,9 @@ def _train_setup_model(
                     "layer_activity": [float(np.abs(w).mean()), float(abs(b))],
                     "feature_strength": np.abs(w).astype(float).tolist(),
                     "output_confidence": float(np.mean(np.abs(pva - 0.5) * 2.0)),
+                    "current_sample": str(df["timestamp"].iloc[sample_idx]),
+                    "prediction": "long_bias" if float(np.mean(pva)) >= 0.5 else "short_bias",
+                    "probability": float(np.mean(pva)),
                 })
 
         probs = _sigmoid(Xn @ w + b)
@@ -271,6 +275,7 @@ def _train_setup_model(
             grad_norm_curve.append(float(grad_norm))
             drift_curve.append(float(drift))
             if epoch_cb is not None:
+                sample_idx = int((epoch * 7) % max(1, len(df)))
                 epoch_cb(epoch + 1, epochs, float(loss), acc, {
                     "val_loss": float(vloss),
                     "val_acc": vacc,
@@ -287,6 +292,9 @@ def _train_setup_model(
                     ],
                     "feature_strength": np.abs(dw1).mean(axis=1).astype(float).tolist(),
                     "output_confidence": float(np.mean(np.abs(pva - 0.5) * 2.0)),
+                    "current_sample": str(df["timestamp"].iloc[sample_idx]),
+                    "prediction": "long_bias" if float(np.mean(pva)) >= 0.5 else "short_bias",
+                    "probability": float(np.mean(pva)),
                 })
 
         probs = _sigmoid((np.tanh(Xn @ w1 + b1) @ w2 + b2).reshape(-1))

@@ -7,7 +7,7 @@ import pandas as pd
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from app.core.feature_engine import generate_features
-from app.core.strategy_engine import evolve_templates, walk_forward_validate, tradingview_strategy_text
+from app.core.strategy_engine import evolve_templates, walk_forward_validate, tradingview_strategy_text, TEMPLATES
 from app.core.ai_engine import analyze_market_ai
 
 
@@ -30,6 +30,9 @@ class AutoResearchWorker(QObject):
     timeline = pyqtSignal(str, int, str)  # stage_name, percent, note
     generation = pyqtSignal(int, int, float, int)  # gen, survivors, best_fitness, population
     candidate_test = pyqtSignal(int, int, int, str)  # gen, done, total, family
+    strategy_event = pyqtSignal(object)
+    mutation_event = pyqtSignal(object)
+    lifecycle_event = pyqtSignal(object)
     ai_epoch = pyqtSignal(int, int, float, float, object)
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
@@ -90,6 +93,7 @@ class AutoResearchWorker(QObject):
             all_generations = []
             best_rows = []
             seed_pool: list[dict] = []
+            template_map = {t.key: t for t in TEMPLATES}
             current_df = featured_df
             if "synthetic" in current_df.columns:
                 synthetic_ratio = float(current_df["synthetic"].fillna(0).mean())
@@ -126,7 +130,76 @@ class AutoResearchWorker(QObject):
                     max_variants=self.config.max_variants_per_generation,
                 )
                 best = top_variants.iloc[0]
+                survivors_keys = set(
+                    (str(r["template_key"]), str(sorted(dict(r["params"]).items())))
+                    for _, r in top_variants.iterrows()
+                )
+                elite_count = min(3, len(top_variants))
+                lifecycle_counts = {
+                    "generated": int(len(all_variants)),
+                    "backtested": int(len(all_variants)),
+                    "validated": int(len(all_variants)),
+                    "survived": int(len(top_variants)),
+                    "rejected": int(len(all_variants) - len(top_variants)),
+                    "mutated": int(len(top_variants)),
+                    "archived": int(elite_count),
+                }
+                self.lifecycle_event.emit(lifecycle_counts)
+                for idx, (_, row) in enumerate(all_variants.iterrows(), start=1):
+                    tkey = str(row["template_key"])
+                    tmpl = template_map.get(tkey)
+                    skey = (tkey, str(sorted(dict(row["params"]).items())))
+                    status = "survived" if skey in survivors_keys else "rejected"
+                    ev = {
+                        "strategy_id": f"GEN{gen}-{idx:04d}",
+                        "generation": gen,
+                        "name": str(row["strategy"]),
+                        "type": tkey,
+                        "timeframe": "active",
+                        "indicators": ", ".join(tmpl.indicators) if tmpl else tkey,
+                        "parameters": dict(row["params"]),
+                        "entry_logic": tmpl.entry_logic if tmpl else "n/a",
+                        "exit_logic": tmpl.exit_logic if tmpl else "n/a",
+                        "filters": tmpl.filters if tmpl else "n/a",
+                        "fitness": float(row["fitness"]),
+                        "robustness": float(row["robustness_score"]),
+                        "validation_score": float(row["robustness_score"]),
+                        "status": status,
+                        "tradingview_ready": "Yes",
+                        "metrics": {
+                            "return_pct": float(row["test_return_pct"]),
+                            "drawdown_pct": float(row["test_max_drawdown_pct"]),
+                            "trades": int(row["test_trades"]),
+                        },
+                    }
+                    self.strategy_event.emit(ev)
+                    self.log.emit(
+                        "INFO",
+                        f"[AI][GEN {gen}][CAND {idx}] Strategy created: {ev['name']} | fitness={ev['fitness']:.2f} robust={ev['robustness']:.2f} status={status}",
+                    )
+
+                if seed_pool and len(top_variants) > 0:
+                    child = top_variants.iloc[0]
+                    parent = seed_pool[0]
+                    parent_params = dict(parent.get("params", {}))
+                    child_params = dict(child["params"])
+                    diffs = []
+                    for k in sorted(set(parent_params) | set(child_params)):
+                        if parent_params.get(k) != child_params.get(k):
+                            diffs.append(f"{k}: {parent_params.get(k)} -> {child_params.get(k)}")
+                    self.mutation_event.emit(
+                        {
+                            "parent_id": f"GEN{gen-1}-TOP",
+                            "child_id": "GEN{gen}-TOP".format(gen=gen),
+                            "mutation_type": "seeded_mutation",
+                            "changes": diffs[:8],
+                            "fitness_delta": float(child["fitness"]) - float(parent.get("fitness", 0.0)),
+                            "robustness_delta": float(child["robustness_score"]) - float(parent.get("robustness_score", 0.0)),
+                        }
+                    )
                 seed_pool = top_variants[["template_key", "params"]].to_dict("records")
+                seed_pool[0]["fitness"] = float(best["fitness"])
+                seed_pool[0]["robustness_score"] = float(best["robustness_score"])
 
                 wf, stability = walk_forward_validate(
                     current_df,

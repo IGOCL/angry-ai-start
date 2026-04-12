@@ -17,6 +17,8 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QCheckBox,
     QPlainTextEdit,
+    QApplication,
+    QFileDialog,
 )
 import pyqtgraph as pg
 
@@ -53,6 +55,11 @@ class AILabPage(QWidget):
         self.pipeline_result = None
         self.live_monitor = None
         self.nn_window = None
+        self.strategy_feed_rows: list[dict] = []
+        self.last_mutation = None
+        self._live_epoch_x: list[int] = []
+        self._live_epoch_loss: list[float] = []
+        self._live_epoch_acc: list[float] = []
         self._build_ui()
 
     def _build_ui(self):
@@ -203,6 +210,57 @@ class AILabPage(QWidget):
         lower_split.setStretchFactor(0, 1)
         lower_split.setStretchFactor(1, 2)
 
+        self.lifecycle_table = QTableWidget(0, 2)
+        self.lifecycle_table.setHorizontalHeaderLabels(["Stage", "Count"])
+        self.mutation_box = QPlainTextEdit()
+        self.mutation_box.setReadOnly(True)
+        self.mutation_box.setPlaceholderText("Mutation inspector waiting...")
+
+        self.strategy_feed = QTableWidget(0, 15)
+        self.strategy_feed.setHorizontalHeaderLabels([
+            "ID", "Gen", "Name", "Type", "Timeframe", "Indicators", "Parameters",
+            "Entry", "Exit", "Filters", "Fitness", "Robustness", "Validation", "Status", "TV"
+        ])
+        self.strategy_feed.itemSelectionChanged.connect(self._on_strategy_selected)
+        self.strategy_text = QPlainTextEdit()
+        self.strategy_text.setReadOnly(True)
+        self.strategy_text.setPlaceholderText("Selected Strategy Text")
+        action_row = QHBoxLayout()
+        self.copy_strategy_btn = QPushButton("Copy Strategy")
+        self.copy_rules_btn = QPushButton("Copy Rules")
+        self.copy_report_btn = QPushButton("Copy Full Report")
+        self.export_btn = QPushButton("Export txt/json")
+        self.open_dna_btn = QPushButton("Open DNA Inspector")
+        self.copy_strategy_btn.clicked.connect(lambda: self._copy_strategy(mode="strategy"))
+        self.copy_rules_btn.clicked.connect(lambda: self._copy_strategy(mode="rules"))
+        self.copy_report_btn.clicked.connect(lambda: self._copy_strategy(mode="report"))
+        self.export_btn.clicked.connect(self._export_strategy_selected)
+        self.open_dna_btn.clicked.connect(self._open_dna_inspector)
+        for b in [self.copy_strategy_btn, self.copy_rules_btn, self.copy_report_btn, self.export_btn, self.open_dna_btn]:
+            action_row.addWidget(b)
+        action_row.addStretch(1)
+
+        feed_split = QSplitter()
+        feed_left = QWidget()
+        fl = QVBoxLayout(feed_left)
+        fl.setContentsMargins(0, 0, 0, 0)
+        fl.addWidget(QLabel("Strategy Feed"))
+        fl.addWidget(self.strategy_feed, 3)
+        fl.addLayout(action_row)
+        fl.addWidget(QLabel("Selected Strategy Text"))
+        fl.addWidget(self.strategy_text, 2)
+        feed_right = QWidget()
+        fr = QVBoxLayout(feed_right)
+        fr.setContentsMargins(0, 0, 0, 0)
+        fr.addWidget(QLabel("Candidate Lifecycle"))
+        fr.addWidget(self.lifecycle_table, 1)
+        fr.addWidget(QLabel("Strategy DNA / Mutation Inspector"))
+        fr.addWidget(self.mutation_box, 2)
+        feed_split.addWidget(feed_left)
+        feed_split.addWidget(feed_right)
+        feed_split.setStretchFactor(0, 3)
+        feed_split.setStretchFactor(1, 1)
+
         layout.addWidget(title)
         layout.addWidget(subtitle)
         layout.addLayout(control)
@@ -212,6 +270,7 @@ class AILabPage(QWidget):
         layout.addWidget(self.summary)
         layout.addWidget(top_split, 2)
         layout.addWidget(lower_split, 2)
+        layout.addWidget(feed_split, 3)
 
         self._set_buttons_running(False)
         self._refresh_summary()
@@ -331,6 +390,9 @@ class AILabPage(QWidget):
         self.pipeline_worker.generation.connect(self._on_generation)
         self.pipeline_worker.candidate_test.connect(self._on_candidate_progress)
         self.pipeline_worker.ai_epoch.connect(self._on_ai_epoch)
+        self.pipeline_worker.strategy_event.connect(self._on_strategy_event)
+        self.pipeline_worker.lifecycle_event.connect(self._on_lifecycle_event)
+        self.pipeline_worker.mutation_event.connect(self._on_mutation_event)
         self.pipeline_worker.finished.connect(self._on_pipeline_finished)
         self.pipeline_worker.error.connect(self._on_pipeline_error)
 
@@ -503,6 +565,13 @@ class AILabPage(QWidget):
     def _on_ai_epoch(self, epoch: int, total: int, loss: float, acc: float, extra: dict | None = None):
         if self.nn_window is not None:
             self.nn_window.on_epoch(epoch, total, loss, acc, extra=extra or {})
+        self._live_epoch_x.append(epoch)
+        self._live_epoch_loss.append(loss)
+        self._live_epoch_acc.append(acc)
+        self.loss_plot.clear()
+        self.acc_plot.clear()
+        self.loss_plot.plot(self._live_epoch_x, self._live_epoch_loss, pen=pg.mkPen("#ff6b6b", width=2))
+        self.acc_plot.plot(self._live_epoch_x, self._live_epoch_acc, pen=pg.mkPen("#00d4ff", width=2))
 
     def _on_pipeline_error(self, text: str):
         self._set_buttons_running(False)
@@ -539,5 +608,110 @@ class AILabPage(QWidget):
         self.regime_table.setRowCount(0)
         self.conf_table.setRowCount(0)
         self.pred_table.setRowCount(0)
+        self.strategy_feed_rows.clear()
+        self._live_epoch_x.clear()
+        self._live_epoch_loss.clear()
+        self._live_epoch_acc.clear()
+        self.strategy_feed.setRowCount(0)
+        self.strategy_text.clear()
+        self.mutation_box.clear()
+        self.lifecycle_table.setRowCount(0)
         if self.nn_window is not None:
             self.nn_window.reset_run()
+
+    def _on_strategy_event(self, ev: dict):
+        self.strategy_feed_rows.append(ev)
+        r = self.strategy_feed.rowCount()
+        self.strategy_feed.insertRow(r)
+        vals = [
+            ev["strategy_id"], ev["generation"], ev["name"], ev["type"], ev["timeframe"],
+            ev["indicators"], str(ev["parameters"]), ev["entry_logic"], ev["exit_logic"], ev["filters"],
+            f"{ev['fitness']:.2f}", f"{ev['robustness']:.2f}", f"{ev['validation_score']:.2f}", ev["status"], ev["tradingview_ready"]
+        ]
+        for c, v in enumerate(vals):
+            self.strategy_feed.setItem(r, c, QTableWidgetItem(str(v)))
+        self.strategy_feed.scrollToBottom()
+
+    def _on_lifecycle_event(self, counts: dict):
+        self.lifecycle_table.setRowCount(0)
+        for k, v in counts.items():
+            r = self.lifecycle_table.rowCount()
+            self.lifecycle_table.insertRow(r)
+            self.lifecycle_table.setItem(r, 0, QTableWidgetItem(str(k)))
+            self.lifecycle_table.setItem(r, 1, QTableWidgetItem(str(v)))
+
+    def _on_mutation_event(self, mutation: dict):
+        self.last_mutation = mutation
+        self.mutation_box.setPlainText(
+            "\n".join([
+                f"Parent: {mutation.get('parent_id', 'n/a')}",
+                f"Child: {mutation.get('child_id', 'n/a')}",
+                f"Mutation Type: {mutation.get('mutation_type', 'n/a')}",
+                "Changes:",
+                *[f"- {x}" for x in mutation.get("changes", [])],
+                f"Fitness Δ: {mutation.get('fitness_delta', 0.0):.2f}",
+                f"Robustness Δ: {mutation.get('robustness_delta', 0.0):.2f}",
+            ])
+        )
+
+    def _selected_strategy_row(self) -> dict | None:
+        row = self.strategy_feed.currentRow()
+        if row < 0 or row >= len(self.strategy_feed_rows):
+            return None
+        return self.strategy_feed_rows[row]
+
+    def _on_strategy_selected(self):
+        ev = self._selected_strategy_row()
+        if ev is None:
+            return
+        m = ev.get("metrics", {})
+        indicators_block = str(ev["indicators"]).replace(", ", "\n- ")
+        text = (
+            f"Strategy ID: {ev['strategy_id']}\n"
+            f"Name: {ev['name']}\n"
+            f"Type: {ev['type']}\n"
+            f"Timeframe: {ev['timeframe']}\n\n"
+            f"Indicators:\n- {indicators_block}\n\n"
+            f"Entry Logic:\n- {ev['entry_logic']}\n\n"
+            f"Exit Logic:\n- {ev['exit_logic']}\n\n"
+            f"Filters:\n- {ev['filters']}\n\n"
+            f"Fitness: {ev['fitness']:.2f}\n"
+            f"Robustness: {ev['robustness']:.2f}\n"
+            f"Validation Score: {ev['validation_score']:.2f}\n"
+            f"Max Drawdown: {m.get('drawdown_pct', 0.0):.2f}%\n"
+            f"Return: {m.get('return_pct', 0.0):.2f}%\n"
+            f"Trade Count: {m.get('trades', 0)}\n"
+            f"TradingView Replicable: {ev['tradingview_ready']}\n"
+        )
+        self.strategy_text.setPlainText(text)
+
+    def _copy_strategy(self, mode: str = "strategy"):
+        ev = self._selected_strategy_row()
+        if ev is None:
+            return
+        if mode == "rules":
+            out = f"Entry: {ev['entry_logic']}\nExit: {ev['exit_logic']}\nFilters: {ev['filters']}"
+        elif mode == "report":
+            out = self.strategy_text.toPlainText() + f"\nParameters:\n{ev['parameters']}"
+        else:
+            out = self.strategy_text.toPlainText()
+        QApplication.clipboard().setText(out)
+
+    def _export_strategy_selected(self):
+        ev = self._selected_strategy_row()
+        if ev is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export Strategy", "strategy_report.txt", "Text (*.txt);;JSON (*.json)")
+        if not path:
+            return
+        if path.endswith(".json"):
+            import json
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(ev, f, indent=2)
+        else:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.strategy_text.toPlainText() + "\n\nParameters:\n" + str(ev["parameters"]))
+
+    def _open_dna_inspector(self):
+        if self.last_mutation:
+            QMessageBox.information(self, "DNA Inspector", self.mutation_box.toPlainText() or "No mutation data yet.")
