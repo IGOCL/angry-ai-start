@@ -28,6 +28,7 @@ from app.ui.ai_live_monitor import AILiveMonitorDialog
 FEATURE_GROUPS = [
     "EMA", "SMA", "RSI", "MACD", "ATR", "BOLLINGER",
     "VOLATILITY", "VOLUME_SPIKE", "BREAKOUT", "CANDLE_RATIOS",
+    "VWAP", "MOMENTUM", "ORDER_FLOW", "ZSCORE", "DONCHIAN", "STOCHASTIC",
 ]
 
 

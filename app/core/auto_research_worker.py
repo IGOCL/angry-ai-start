@@ -17,7 +17,7 @@ class ResearchRunConfig:
     generations: int = 4
     population_top_k: int = 12
     validation_folds: int = 4
-    max_rows_for_evolution: int = 12_000
+    max_rows_for_evolution: int = 6_000
     max_rows_for_ai: int = 80_000
 
 
@@ -87,6 +87,16 @@ class AutoResearchWorker(QObject):
             all_generations = []
             best_rows = []
             current_df = featured_df
+            if "synthetic" in current_df.columns:
+                synthetic_ratio = float(current_df["synthetic"].fillna(0).mean())
+                if synthetic_ratio > 0.40:
+                    filtered = current_df[current_df["synthetic"].fillna(0).astype(int) == 0]
+                    if len(filtered) >= 500:
+                        self.log.emit(
+                            "WARN",
+                            f"Synthetic-heavy slice detected ({synthetic_ratio:.2%}); evolution uses non-synthetic rows: {len(current_df):,} -> {len(filtered):,}",
+                        )
+                        current_df = filtered.reset_index(drop=True)
             if len(current_df) > self.config.max_rows_for_evolution:
                 stride = max(1, len(current_df) // self.config.max_rows_for_evolution)
                 current_df = current_df.iloc[::stride].reset_index(drop=True)

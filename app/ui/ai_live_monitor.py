@@ -12,7 +12,9 @@ from PyQt6.QtWidgets import (
     QWidget,
     QHBoxLayout,
 )
+from PyQt6.QtCore import QTimer
 import pyqtgraph as pg
+import math
 
 
 class AILiveMonitorDialog(QDialog):
@@ -23,6 +25,10 @@ class AILiveMonitorDialog(QDialog):
 
         self.fitness_points_x = []
         self.fitness_points_y = []
+        self.candidate_points_x = []
+        self.candidate_points_y = []
+        self.pulse_x = list(range(120))
+        self.pulse_phase = 0.0
 
         layout = QVBoxLayout(self)
 
@@ -31,10 +37,12 @@ class AILiveMonitorDialog(QDialog):
 
         self.overall_progress = QProgressBar()
         self.overall_progress.setRange(0, 100)
+        self.overall_progress.setTextVisible(True)
 
         self.candidate_progress_label = QLabel("Candidate tests: idle")
         self.candidate_progress = QProgressBar()
         self.candidate_progress.setRange(0, 100)
+        self.candidate_progress.setTextVisible(True)
 
         top = QHBoxLayout()
         top.addWidget(self.stage_label, 2)
@@ -67,7 +75,17 @@ class AILiveMonitorDialog(QDialog):
         self.fitness_plot = pg.PlotWidget(title="Best Fitness by Generation")
         self.fitness_plot.setLabel("left", "Fitness")
         self.fitness_plot.setLabel("bottom", "Generation")
-        rl.addWidget(self.fitness_plot, 2)
+        rl.addWidget(self.fitness_plot, 1)
+
+        self.candidate_plot = pg.PlotWidget(title="Candidate Test Throughput")
+        self.candidate_plot.setLabel("left", "Done / Total")
+        self.candidate_plot.setLabel("bottom", "Tick")
+        rl.addWidget(self.candidate_plot, 1)
+
+        self.pulse_plot = pg.PlotWidget(title="AI Pulse (Live Activity)")
+        self.pulse_plot.setLabel("left", "Activity")
+        self.pulse_plot.setLabel("bottom", "Frame")
+        rl.addWidget(self.pulse_plot, 1)
 
         rl.addWidget(QLabel("Live Engine Logs"))
         self.log_box = QTextEdit()
@@ -80,6 +98,11 @@ class AILiveMonitorDialog(QDialog):
         split.setStretchFactor(1, 3)
 
         layout.addWidget(split, 1)
+
+        self.pulse_timer = QTimer(self)
+        self.pulse_timer.setInterval(120)
+        self.pulse_timer.timeout.connect(self._tick_pulse)
+        self.pulse_timer.start()
 
     def on_progress(self, value: int):
         self.overall_progress.setValue(max(0, min(100, int(value))))
@@ -100,6 +123,14 @@ class AILiveMonitorDialog(QDialog):
         self.candidate_progress.setValue(pct)
         self.candidate_progress_label.setText(
             f"Candidate tests | gen {gen} | {family} | {done}/{total}"
+        )
+        self.candidate_points_x.append(len(self.candidate_points_x) + 1)
+        self.candidate_points_y.append(done / max(1, total))
+        self.candidate_plot.clear()
+        self.candidate_plot.plot(
+            self.candidate_points_x[-300:],
+            self.candidate_points_y[-300:],
+            pen=pg.mkPen(color="#00d4ff", width=2),
         )
 
     def on_generation(self, gen: int, survivors: int, best_fitness: float, population: int):
@@ -127,3 +158,9 @@ class AILiveMonitorDialog(QDialog):
         self.candidate_progress.setValue(100)
         self.candidate_progress_label.setText("Candidate tests: complete")
         self.log_box.append("[INFO] Live monitor: run complete")
+
+    def _tick_pulse(self):
+        self.pulse_phase += 0.25
+        y = [0.5 + 0.45 * math.sin((i / 8.0) + self.pulse_phase) for i in self.pulse_x]
+        self.pulse_plot.clear()
+        self.pulse_plot.plot(self.pulse_x, y, pen=pg.mkPen(color="#ff9f1a", width=2))

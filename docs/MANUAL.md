@@ -42,6 +42,7 @@ Settings:
 - **Population**: top candidates kept per generation sweep
 - **Generations**: number of evolution rounds
 - **Feature toggles**: indicator/feature groups used in auto feature engineering
+  - Includes expanded groups: VWAP, Momentum, Order Flow, Z-Score, Donchian, Stochastic
 
 ---
 
@@ -90,6 +91,7 @@ Contains deterministic rule summary and parameters for implementation in Pine Sc
 - Prediction distribution
 - Loss/accuracy curves
 - Fitness-by-generation curve
+- Live monitor also shows candidate throughput and an activity pulse chart
 
 ---
 
