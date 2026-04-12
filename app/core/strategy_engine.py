@@ -301,29 +301,37 @@ def evolve_templates(
     df: pd.DataFrame,
     config: BacktestConfig | None = None,
     top_k: int = 8,
+    progress_cb=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     cfg = config or BacktestConfig()
     all_rows: list[dict[str, Any]] = []
 
-    for t in TEMPLATES:
-        for params in _variant_param_grid(t.key, t.params):
+    grids = [(t, p) for t in TEMPLATES for p in _variant_param_grid(t.key, t.params)]
+    total = max(1, len(grids))
+
+    for idx, (t, params) in enumerate(grids, start=1):
+        if progress_cb is not None and (idx == 1 or idx % 3 == 0 or idx == total):
             try:
-                evaluated = evaluate_template(df, t.key, params=params, config=cfg)
-                test = evaluated["test"].metrics
-                all_rows.append(
-                    {
-                        "strategy": t.name,
-                        "template_key": t.key,
-                        "params": evaluated["params"],
-                        "robustness_score": float(evaluated["robustness_score"]),
-                        "test_return_pct": float(test["total_return_pct"]),
-                        "test_win_rate_pct": float(test["win_rate_pct"]),
-                        "test_max_drawdown_pct": float(test["max_drawdown_pct"]),
-                        "test_trades": int(test["total_trades"]),
-                    }
-                )
+                progress_cb(idx, total, t.name)
             except Exception:
-                continue
+                pass
+        try:
+            evaluated = evaluate_template(df, t.key, params=params, config=cfg)
+            test = evaluated["test"].metrics
+            all_rows.append(
+                {
+                    "strategy": t.name,
+                    "template_key": t.key,
+                    "params": evaluated["params"],
+                    "robustness_score": float(evaluated["robustness_score"]),
+                    "test_return_pct": float(test["total_return_pct"]),
+                    "test_win_rate_pct": float(test["win_rate_pct"]),
+                    "test_max_drawdown_pct": float(test["max_drawdown_pct"]),
+                    "test_trades": int(test["total_trades"]),
+                }
+            )
+        except Exception:
+            continue
 
     if not all_rows:
         raise ValueError("Evolution engine could not evaluate any template variants")

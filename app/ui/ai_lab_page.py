@@ -67,11 +67,11 @@ class AILabPage(QWidget):
 
         self.population_spin = QSpinBox()
         self.population_spin.setRange(4, 100)
-        self.population_spin.setValue(12)
+        self.population_spin.setValue(8)
 
         self.generation_spin = QSpinBox()
         self.generation_spin.setRange(1, 20)
-        self.generation_spin.setValue(4)
+        self.generation_spin.setValue(2)
 
         self.auto_mode = QCheckBox("Auto mode")
         self.auto_mode.setChecked(True)
@@ -199,6 +199,7 @@ class AILabPage(QWidget):
         layout.addWidget(top_split, 2)
         layout.addWidget(lower_split, 2)
 
+        self._set_buttons_running(False)
         self._refresh_summary()
 
     def _selected_features(self):

@@ -17,6 +17,8 @@ class ResearchRunConfig:
     generations: int = 4
     population_top_k: int = 12
     validation_folds: int = 4
+    max_rows_for_evolution: int = 12_000
+    max_rows_for_ai: int = 80_000
 
 
 class AutoResearchWorker(QObject):
@@ -84,11 +86,27 @@ class AutoResearchWorker(QObject):
             all_generations = []
             best_rows = []
             current_df = featured_df
+            if len(current_df) > self.config.max_rows_for_evolution:
+                stride = max(1, len(current_df) // self.config.max_rows_for_evolution)
+                current_df = current_df.iloc[::stride].reset_index(drop=True)
+                self.log.emit(
+                    "WARN",
+                    f"Evolution input downsampled for speed: {len(featured_df):,} -> {len(current_df):,} rows (stride {stride})",
+                )
 
             for gen in range(1, self.config.generations + 1):
                 self._checkpoint()
 
-                all_variants, top_variants = evolve_templates(current_df, top_k=self.config.population_top_k)
+                def _variant_progress(done: int, total: int, family: str):
+                    pct = int((done / max(1, total)) * 100)
+                    self.timeline.emit("Strategy evolution", pct, f"gen {gen}: {family} {done}/{total}")
+                    self._checkpoint()
+
+                all_variants, top_variants = evolve_templates(
+                    current_df,
+                    top_k=self.config.population_top_k,
+                    progress_cb=_variant_progress,
+                )
                 best = top_variants.iloc[0]
 
                 wf, stability = walk_forward_validate(
@@ -130,7 +148,15 @@ class AutoResearchWorker(QObject):
             self.timeline.emit("AI analysis", 15, "training regime/confidence model")
             self.progress.emit(85)
 
-            ai_result = analyze_market_ai(featured_df)
+            ai_df = featured_df
+            if len(ai_df) > self.config.max_rows_for_ai:
+                stride = max(1, len(ai_df) // self.config.max_rows_for_ai)
+                ai_df = ai_df.iloc[::stride].reset_index(drop=True)
+                self.log.emit(
+                    "WARN",
+                    f"AI input downsampled for speed: {len(featured_df):,} -> {len(ai_df):,} rows (stride {stride})",
+                )
+            ai_result = analyze_market_ai(ai_df)
             self.timeline.emit("AI analysis", 100, "AI outputs ready")
 
             self.stage.emit("Step J: Final ranking and export package")

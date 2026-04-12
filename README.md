@@ -15,3 +15,6 @@ Desktop build with:
 ## Run
 pip install -r requirements.txt
 python main.py
+
+## Manual
+See `docs/MANUAL.md` for a step-by-step operating guide.
