@@ -19,7 +19,7 @@ Item {
             Item { Layout.fillWidth: true }
             ComboBox {
                 id: tf
-                model: ["1s", "1m", "5m", "15m"]
+                model: ["1s", "1m", "5m", "15m", "30m", "1h", "2h", "4h"]
                 currentIndex: Math.max(0, model.indexOf(appState.chartTimeframe))
                 onActivated: appState.setChartTimeframe(currentText)
             }
@@ -89,6 +89,14 @@ Item {
                         var h = Math.max(1, Math.abs(yC - yO))
                         ctx.fillRect(x - cw * 0.32, top, cw * 0.64, h)
                     }
+
+                    // axis labels (price and date)
+                    ctx.fillStyle = "#8FA8C8"
+                    ctx.font = "11px sans-serif"
+                    ctx.fillText(maxH.toFixed(4), 6, 14)
+                    ctx.fillText(minL.toFixed(4), 6, height - 6)
+                    ctx.fillText(String(candles[0].t), 80, height - 6)
+                    ctx.fillText(String(candles[candles.length - 1].t), Math.max(80, width - 220), height - 6)
                 }
 
                 Connections {

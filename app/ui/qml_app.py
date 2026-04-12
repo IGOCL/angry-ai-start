@@ -189,6 +189,8 @@ class AppState(QObject):
     chartCandlesChanged = Signal()
     chartTimeframeChanged = Signal()
     chartWindowChanged = Signal()
+    previewRowsChanged = Signal()
+    previewColumnsChanged = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -212,6 +214,8 @@ class AppState(QObject):
         self._chart_all_candles: list[dict] = []
         self._chart_window_size = 220
         self._chart_window_end = 0
+        self._preview_rows: list[dict] = []
+        self._preview_columns: list[str] = []
 
         self._thread: QThread | None = None
         self._worker: ResearchWorker | None = None
@@ -308,6 +312,14 @@ class AppState(QObject):
     def chartWindowEnd(self):
         return self._chart_window_end
 
+    @Property("QVariantList", notify=previewRowsChanged)
+    def previewRows(self):
+        return self._preview_rows
+
+    @Property("QVariantList", notify=previewColumnsChanged)
+    def previewColumns(self):
+        return self._preview_columns
+
     @Slot(str)
     def setDatasetPath(self, dataset_path: str):
         normalized = self._normalize_dataset_path(dataset_path)
@@ -326,6 +338,10 @@ class AppState(QObject):
             df, profile = load_market_file_minimal(self._dataset_path)
             self._base_df = df
             self._profile = asdict(profile)
+            self._preview_columns = list(df.columns)
+            self._preview_rows = df.head(20).astype(str).to_dict("records")
+            self.previewColumnsChanged.emit()
+            self.previewRowsChanged.emit()
             self.profileChanged.emit()
             self._refresh_chart_data()
             self._set_stage("Dataset loaded")
@@ -336,9 +352,26 @@ class AppState(QObject):
             self._append_log("ERROR", f"Dataset load failed: {type(exc).__name__}: {exc}")
 
 
+
+    @Slot()
+    def clearDataset(self):
+        self._append_log("UI", "Clear dataset clicked")
+        self._base_df = None
+        self._dataset_path = ""
+        self.datasetPathChanged.emit()
+        self._profile = {}
+        self.profileChanged.emit()
+        self._preview_rows = []
+        self._preview_columns = []
+        self.previewRowsChanged.emit()
+        self.previewColumnsChanged.emit()
+        self._refresh_chart_data()
+        self._set_stage("Dataset cleared")
+        self._append_log("INFO", "Dataset cleared from shared app state")
+
     @Slot(str)
     def setChartTimeframe(self, timeframe: str):
-        tf = timeframe if timeframe in {"1s", "1m", "5m", "15m"} else "1s"
+        tf = timeframe if timeframe in {"1s", "1m", "5m", "15m", "30m", "1h", "2h", "4h"} else "1s"
         self._chart_timeframe = tf
         self._append_log("UI", f"Chart timeframe changed: {tf}")
         self.chartTimeframeChanged.emit()
@@ -402,7 +435,6 @@ class AppState(QObject):
         self._val_accuracy_series = []
         self._regime_counts = {}
         self._feature_importance = {}
-        self._profile = {}
         self.strategiesChanged.emit()
         self.selectedStrategyChanged.emit()
         self.fitnessSeriesChanged.emit()
@@ -410,7 +442,6 @@ class AppState(QObject):
         self.accuracySeriesChanged.emit()
         self.valLossSeriesChanged.emit()
         self.valAccuracySeriesChanged.emit()
-        self.profileChanged.emit()
 
         if self._base_df is None:
             self.loadDataset()
@@ -528,6 +559,8 @@ class AppState(QObject):
 
         self._profile = dict(data.get("profile", {}))
         self.profileChanged.emit()
+        self.previewRowsChanged.emit()
+        self.previewColumnsChanged.emit()
 
         self._fitness_series = list(data.get("fitness_series", []))
         self.fitnessSeriesChanged.emit()

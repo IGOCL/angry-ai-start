@@ -16,7 +16,7 @@ Item {
 
             Rectangle {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 160
+                Layout.preferredHeight: 190
                 radius: 12
                 color: "#111C2D"
                 border.color: "#1A2A40"
@@ -30,6 +30,48 @@ Item {
                     Label { text: "Columns: " + ((appState.profile.columns || []).join(", ")); color: "#9BB6D8"; width: parent.width; wrapMode: Text.Wrap }
                     Label { text: "Range: " + (appState.profile.start || "n/a") + " -> " + (appState.profile.end || "n/a"); color: "#9BB6D8"; width: parent.width; elide: Text.ElideRight }
                     Label { text: "Synthetic %: " + Number(appState.profile.synthetic_pct || 0).toFixed(2); color: "#8FD3FF" }
+                    Button { text: "Clear Dataset"; onClicked: appState.clearDataset() }
+                }
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 300
+                radius: 12
+                color: "#0F1725"
+                border.color: "#1B2A41"
+                Column {
+                    anchors.fill: parent
+                    anchors.margins: 10
+                    spacing: 6
+                    Label { text: "Preview (first 20 rows)"; color: "#DCEAFF"; font.bold: true }
+                    ScrollView {
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.bottom: parent.bottom
+                        anchors.topMargin: 26
+                        TextArea {
+                            readOnly: true
+                            wrapMode: Text.NoWrap
+                            color: "#BFD3EC"
+                            text: {
+                                var cols = appState.previewColumns || []
+                                if (cols.length === 0)
+                                    return "No dataset loaded"
+                                var lines = [cols.join(" | ")]
+                                var rows = appState.previewRows || []
+                                for (var i = 0; i < rows.length; ++i) {
+                                    var r = rows[i]
+                                    var vals = []
+                                    for (var c = 0; c < cols.length; ++c)
+                                        vals.push(r[cols[c]])
+                                    lines.push(vals.join(" | "))
+                                }
+                                return lines.join("\n")
+                            }
+                        }
+                    }
                 }
             }
 
