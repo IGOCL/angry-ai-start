@@ -197,9 +197,9 @@ class AILabPage(QWidget):
         self.evolution_diag_box.setReadOnly(True)
         self.evolution_diag_box.setPlaceholderText("Evolution diagnostics waiting...")
 
-        self.strategy_feed = QTableWidget(0, 18)
+        self.strategy_feed = QTableWidget(0, 20)
         self.strategy_feed.setHorizontalHeaderLabels([
-            "ID", "Gen", "Name", "Type", "Timeframe", "Indicators", "Parameters",
+            "ID", "Gen", "Name", "Family", "Regime", "Type", "Timeframe", "Indicators", "Parameters",
             "Entry", "Exit", "Filters", "Fitness", "Robustness", "Validation", "Status", "TV",
             "Origin", "Mutation", "Parent"
         ])
@@ -679,7 +679,8 @@ class AILabPage(QWidget):
         r = self.strategy_feed.rowCount()
         self.strategy_feed.insertRow(r)
         vals = [
-            ev["strategy_id"], ev["generation"], ev["name"], ev["type"], ev["timeframe"],
+            ev["strategy_id"], ev["generation"], ev["name"], ev.get("family", "-"), ev.get("regime_suitability", "-"),
+            ev["type"], ev["timeframe"],
             ev["indicators"], str(ev["parameters"]), ev["entry_logic"], ev["exit_logic"], ev["filters"],
             f"{ev['fitness']:.2f}", f"{ev['robustness']:.2f}", f"{ev['validation_score']:.2f}", ev["status"], ev["tradingview_ready"],
             ev.get("origin", "random"), ev.get("mutation_type", "base"), ev.get("parent_strategy_id", "none")
@@ -743,18 +744,28 @@ class AILabPage(QWidget):
         text = (
             f"Strategy ID: {ev['strategy_id']}\n"
             f"Name: {ev['name']}\n"
+            f"Family: {ev.get('family', 'n/a')}\n"
+            f"Generation: {ev['generation']}\n"
+            f"Origin: {ev.get('origin', 'random')}\n"
+            f"Parent(s): {ev.get('parent_strategy_id', 'none')}\n\n"
+            f"Timeframe: {ev['timeframe']}\n"
+            f"Regime Suitability: {ev.get('regime_suitability', 'n/a')}\n\n"
             f"Type: {ev['type']}\n"
-            f"Timeframe: {ev['timeframe']}\n\n"
-            f"Indicators:\n- {indicators_block}\n\n"
+            f"Modules Used: {', '.join(ev.get('modules_used', []))}\n"
+            f"Indicators / Features:\n- {indicators_block}\n"
+            f"Parameters: {ev['parameters']}\n\n"
             f"Entry Logic:\n- {ev['entry_logic']}\n\n"
             f"Exit Logic:\n- {ev['exit_logic']}\n\n"
             f"Filters:\n- {ev['filters']}\n\n"
-            f"Fitness: {ev['fitness']:.2f}\n"
+            f"Risk Model:\n- {ev.get('risk_model', 'n/a')}\n\n"
+            f"Performance:\n"
+            f"- Return: {m.get('return_pct', 0.0):.2f}%\n"
+            f"- Max Drawdown: {m.get('drawdown_pct', 0.0):.2f}%\n"
+            f"- Trade Count: {m.get('trades', 0)}\n\n"
+            f"Validation: {ev['validation_score']:.2f}\n"
             f"Robustness: {ev['robustness']:.2f}\n"
-            f"Validation Score: {ev['validation_score']:.2f}\n"
-            f"Max Drawdown: {m.get('drawdown_pct', 0.0):.2f}%\n"
-            f"Return: {m.get('return_pct', 0.0):.2f}%\n"
-            f"Trade Count: {m.get('trades', 0)}\n"
+            f"Notes: {ev.get('notes', 'n/a')}\n\n"
+            f"TradingView Replication Notes:\n- {ev.get('tradingview_replication_notes', 'n/a')}\n"
             f"TradingView Replicable: {ev['tradingview_ready']}\n"
         )
         self.strategy_text.setPlainText(text)

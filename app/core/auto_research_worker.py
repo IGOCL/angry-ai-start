@@ -11,6 +11,42 @@ from app.core.strategy_engine import evolve_templates, walk_forward_validate, tr
 from app.core.ai_engine import analyze_market_ai
 
 
+def _infer_strategy_profile(template_key: str, params: dict) -> dict:
+    key = (template_key or "").lower()
+    family = "Composite"
+    regime = "mixed"
+    modules = ["Regime", "Structure", "Flow", "Timing", "Risk", "Filters"]
+    risk_model = "ATR stop + fixed RR"
+    notes = "Deterministic signals only; avoid synthetic-triggered entries."
+
+    if "ema" in key or "trend" in key:
+        family = "Trend Continuation"
+        regime = "trend / volatility expansion"
+        risk_model = "ATR stop + trend trailing"
+    elif "breakout" in key:
+        family = "Breakout Expansion"
+        regime = "compression release / breakout phase"
+        risk_model = "structure stop + adaptive target"
+    elif "reversal" in key or "rsi" in key:
+        family = "Mean Reversion"
+        regime = "range / failed breakout"
+        risk_model = "structure stop + time stop"
+    elif "vwap" in key:
+        family = "Order Flow Reclaim"
+        regime = "intraday trend with participation"
+        risk_model = "VWAP invalidation + ATR emergency exit"
+
+    return {
+        "family": family,
+        "regime_suitability": regime,
+        "modules_used": modules,
+        "risk_model": risk_model,
+        "notes": notes,
+        "tradingview_replication_notes": "Use bar-close confirmation with next-bar execution assumptions.",
+        "parameters": params,
+    }
+
+
 @dataclass
 class ResearchRunConfig:
     selected_features: list[str]
@@ -158,17 +194,22 @@ class AutoResearchWorker(QObject):
                     tmpl = template_map.get(tkey)
                     skey = (tkey, str(sorted(dict(row["params"]).items())))
                     status = "survived" if skey in survivors_keys else "rejected"
+                    profile_info = _infer_strategy_profile(tkey, dict(row["params"]))
                     ev = {
                         "strategy_id": f"GEN{gen}-{idx:04d}",
                         "generation": gen,
                         "name": str(row["strategy"]),
                         "type": tkey,
+                        "family": profile_info["family"],
+                        "regime_suitability": profile_info["regime_suitability"],
                         "timeframe": "active",
                         "indicators": ", ".join(tmpl.indicators) if tmpl else tkey,
+                        "modules_used": profile_info["modules_used"],
                         "parameters": dict(row["params"]),
                         "entry_logic": tmpl.entry_logic if tmpl else "n/a",
                         "exit_logic": tmpl.exit_logic if tmpl else "n/a",
                         "filters": tmpl.filters if tmpl else "n/a",
+                        "risk_model": profile_info["risk_model"],
                         "fitness": float(row["fitness"]),
                         "robustness": float(row["robustness_score"]),
                         "validation_score": float(row["robustness_score"]),
@@ -182,6 +223,8 @@ class AutoResearchWorker(QObject):
                             "drawdown_pct": float(row["test_max_drawdown_pct"]),
                             "trades": int(row["test_trades"]),
                         },
+                        "notes": profile_info["notes"],
+                        "tradingview_replication_notes": profile_info["tradingview_replication_notes"],
                     }
                     self.strategy_event.emit(ev)
                     self.log.emit(
