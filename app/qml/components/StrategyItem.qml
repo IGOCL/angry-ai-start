@@ -5,7 +5,7 @@ import QtQuick.Layouts
 Rectangle {
     id: root
     required property var row
-    required property int index
+    property int itemIndex: -1
     property bool selected: false
     signal clicked(int index)
 
@@ -37,6 +37,6 @@ Rectangle {
         hoverEnabled: true
         onEntered: root.hovered = true
         onExited: root.hovered = false
-        onClicked: root.clicked(root.index)
+        onClicked: root.clicked(root.itemIndex)
     }
 }

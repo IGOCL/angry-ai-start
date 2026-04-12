@@ -32,7 +32,7 @@ ApplicationWindow {
             id: nav
             Layout.fillHeight: true
             currentIndex: root.navIndex
-            onIndexChanged: root.navIndex = index
+            onIndexChanged: function(i) { root.navIndex = i }
         }
 
         ColumnLayout {

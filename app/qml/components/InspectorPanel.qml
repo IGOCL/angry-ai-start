@@ -44,7 +44,6 @@ Rectangle {
                     readOnly: true
                     wrapMode: Text.Wrap
                     color: "#D7E5FA"
-                    background: Rectangle { color: "transparent" }
                 }
             }
         }

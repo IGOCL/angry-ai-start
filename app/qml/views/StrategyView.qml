@@ -4,7 +4,8 @@ import QtQuick.Layouts
 import "../components"
 
 Item {
-    anchors.fill: parent
+    Layout.fillWidth: true
+    Layout.fillHeight: true
 
     ColumnLayout {
         anchors.fill: parent
@@ -28,9 +29,9 @@ Item {
                     model: appState.strategies
                     delegate: StrategyItem {
                         required property var modelData
-                        required property int index
                         width: parent.width
                         row: modelData
+                        itemIndex: index
                         visible: {
                             var q = search.text.toLowerCase()
                             var passSearch = q.length === 0 || modelData.name.toLowerCase().indexOf(q) >= 0 || modelData.id.toLowerCase().indexOf(q) >= 0
@@ -38,7 +39,7 @@ Item {
                             return passSearch && passFamily
                         }
                         selected: appState.selectedStrategy && appState.selectedStrategy.id === modelData.id
-                        onClicked: appState.selectStrategy(index)
+                        onClicked: function(i) { appState.selectStrategy(i) }
                     }
                 }
             }
