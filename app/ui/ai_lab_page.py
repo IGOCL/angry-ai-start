@@ -31,6 +31,7 @@ FEATURE_GROUPS = [
     "VOLATILITY", "VOLUME_SPIKE", "BREAKOUT", "CANDLE_RATIOS",
     "VWAP", "MOMENTUM", "ORDER_FLOW", "ZSCORE", "DONCHIAN", "STOCHASTIC",
     "KELTNER", "ADX", "CCI", "WILLIAMS_R", "OBV", "CMF", "ICHIMOKU",
+    "SUPERTREND", "FRACTAL", "MICROSTRUCTURE",
 ]
 
 
@@ -72,12 +73,12 @@ class AILabPage(QWidget):
         self.timeframe_box.currentTextChanged.connect(self._ensure_timeframe_ready)
 
         self.population_spin = QSpinBox()
-        self.population_spin.setRange(4, 100)
-        self.population_spin.setValue(8)
+        self.population_spin.setRange(6, 300)
+        self.population_spin.setValue(24)
 
         self.generation_spin = QSpinBox()
-        self.generation_spin.setRange(1, 20)
-        self.generation_spin.setValue(2)
+        self.generation_spin.setRange(1, 200)
+        self.generation_spin.setValue(12)
 
         self.auto_mode = QCheckBox("Auto mode")
         self.auto_mode.setChecked(True)
@@ -305,7 +306,9 @@ class AILabPage(QWidget):
             selected_features=selected,
             generations=int(self.generation_spin.value()),
             population_top_k=int(self.population_spin.value()),
+            max_variants_per_generation=max(250, int(self.population_spin.value()) * 25),
             validation_folds=4,
+            model_type=self.model_box.currentText(),
         )
 
         self.pipeline_thread = QThread()
@@ -398,11 +401,15 @@ class AILabPage(QWidget):
         self.generation_table.setItem(row, 4, QTableWidgetItem("-"))
         self.generation_table.setItem(row, 5, QTableWidgetItem(f"survivors={survivors}"))
         self.generation_table.setItem(row, 6, QTableWidgetItem(f"population={population}"))
+        if self.nn_window is not None:
+            self.nn_window.on_generation(gen, survivors, population)
 
     def _on_candidate_progress(self, gen: int, done: int, total: int, family: str):
         self.stage_label.setText(
             f"Stage: testing candidates | gen {gen} | {family} {done}/{total}"
         )
+        if self.nn_window is not None:
+            self.nn_window.on_candidate(gen, done, total, family)
 
     def _on_pipeline_finished(self, payload):
         self.pipeline_result = payload
@@ -521,3 +528,9 @@ class AILabPage(QWidget):
         self.regime_table.setRowCount(0)
         self.conf_table.setRowCount(0)
         self.pred_table.setRowCount(0)
+        if self.nn_window is not None:
+            self.nn_window.loss_x.clear()
+            self.nn_window.loss_y.clear()
+            self.nn_window.acc_x.clear()
+            self.nn_window.acc_y.clear()
+            self.nn_window.log_box.clear()

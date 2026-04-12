@@ -16,9 +16,11 @@ class ResearchRunConfig:
     selected_features: list[str]
     generations: int = 4
     population_top_k: int = 12
+    max_variants_per_generation: int = 600
     validation_folds: int = 4
     max_rows_for_evolution: int = 6_000
     max_rows_for_ai: int = 80_000
+    model_type: str = "mlp"
 
 
 class AutoResearchWorker(QObject):
@@ -87,6 +89,7 @@ class AutoResearchWorker(QObject):
 
             all_generations = []
             best_rows = []
+            seed_pool: list[dict] = []
             current_df = featured_df
             if "synthetic" in current_df.columns:
                 synthetic_ratio = float(current_df["synthetic"].fillna(0).mean())
@@ -119,8 +122,11 @@ class AutoResearchWorker(QObject):
                     current_df,
                     top_k=self.config.population_top_k,
                     progress_cb=_variant_progress,
+                    seed_pool=seed_pool,
+                    max_variants=self.config.max_variants_per_generation,
                 )
                 best = top_variants.iloc[0]
+                seed_pool = top_variants[["template_key", "params"]].to_dict("records")
 
                 wf, stability = walk_forward_validate(
                     current_df,
@@ -171,7 +177,7 @@ class AutoResearchWorker(QObject):
                 )
             ai_result = analyze_market_ai(
                 ai_df,
-                model_type="mlp",
+                model_type=self.config.model_type,
                 epoch_cb=lambda e, total, loss, acc: self.ai_epoch.emit(e, total, loss, acc),
             )
             self.timeline.emit("AI analysis", 100, "AI outputs ready")

@@ -396,16 +396,87 @@ def _variant_param_grid(template_key: str, base_params: dict[str, Any]) -> list[
     return variants or [base_params]
 
 
+def _mutate_param_variants(template_key: str, params: dict[str, Any], rng: np.random.Generator, n: int = 12) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for _ in range(max(1, n)):
+        p = dict(params)
+        if template_key == "ema_cross_20_50":
+            fast = int(max(3, min(60, p.get("ema_fast", 20) + int(rng.integers(-4, 5)))))
+            slow = int(max(fast + 2, min(180, p.get("ema_slow", 50) + int(rng.integers(-8, 9)))))
+            p.update({"ema_fast": fast, "ema_slow": slow})
+        elif template_key == "rsi_reversal_30_70":
+            rsi_len = int(max(5, min(35, p.get("rsi_len", 14) + int(rng.integers(-3, 4)))))
+            oversold = float(max(10, min(45, p.get("oversold", 30) + int(rng.integers(-4, 5)))))
+            overbought = float(max(55, min(90, p.get("overbought", 70) + int(rng.integers(-4, 5)))))
+            if oversold >= overbought - 5:
+                overbought = oversold + 6
+            p.update({"rsi_len": rsi_len, "oversold": oversold, "overbought": overbought})
+        elif template_key == "breakout_20":
+            lookback = int(max(5, min(120, p.get("lookback", 20) + int(rng.integers(-8, 9)))))
+            p.update({"lookback": lookback})
+        elif template_key == "vwap_reclaim":
+            ema_len = int(max(5, min(120, p.get("ema_len", 34) + int(rng.integers(-8, 9)))))
+            vsm = float(max(0.8, min(3.0, p.get("vol_spike_mult", 1.5) + float(rng.normal(0, 0.18)))))
+            p.update({"ema_len": ema_len, "vol_spike_mult": round(vsm, 3)})
+        elif template_key == "multi_factor_combo":
+            ema_fast = int(max(4, min(50, p.get("ema_fast", 20) + int(rng.integers(-5, 6)))))
+            ema_slow = int(max(ema_fast + 3, min(220, p.get("ema_slow", 50) + int(rng.integers(-12, 13)))))
+            rsi_len = int(max(5, min(34, p.get("rsi_len", 14) + int(rng.integers(-3, 4)))))
+            rsi_long_min = float(max(45, min(68, p.get("rsi_long_min", 52) + int(rng.integers(-4, 5)))))
+            rsi_short_max = float(max(32, min(55, p.get("rsi_short_max", 48) + int(rng.integers(-4, 5)))))
+            if rsi_short_max >= rsi_long_min:
+                rsi_short_max = rsi_long_min - 2.0
+            adx_min = float(max(8, min(42, p.get("adx_min", 18) + int(rng.integers(-4, 5)))))
+            vsm = float(max(0.8, min(3.0, p.get("vol_spike_mult", 1.2) + float(rng.normal(0, 0.15)))))
+            p.update(
+                {
+                    "ema_fast": ema_fast,
+                    "ema_slow": ema_slow,
+                    "rsi_len": rsi_len,
+                    "rsi_long_min": round(rsi_long_min, 2),
+                    "rsi_short_max": round(rsi_short_max, 2),
+                    "adx_min": round(adx_min, 2),
+                    "vol_spike_mult": round(vsm, 3),
+                }
+            )
+        out.append(p)
+    return out
+
+
 def evolve_templates(
     df: pd.DataFrame,
     config: BacktestConfig | None = None,
     top_k: int = 8,
     progress_cb=None,
+    seed_pool: list[dict[str, Any]] | None = None,
+    max_variants: int = 500,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     cfg = config or BacktestConfig()
     all_rows: list[dict[str, Any]] = []
+    rng = np.random.default_rng(42 + len(df) + top_k)
 
     grids = [(t, p) for t in TEMPLATES for p in _variant_param_grid(t.key, t.params)]
+    if seed_pool:
+        template_map = {t.key: t for t in TEMPLATES}
+        for seed in seed_pool:
+            key = str(seed.get("template_key", ""))
+            params = dict(seed.get("params", {}))
+            t = template_map.get(key)
+            if t is None:
+                continue
+            grids.append((t, params))
+            for mp in _mutate_param_variants(key, params, rng=rng, n=20):
+                grids.append((t, mp))
+
+    dedup: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[StrategyTemplate, dict[str, Any]]] = {}
+    for t, p in grids:
+        key = (t.key, tuple(sorted((str(k), str(v)) for k, v in p.items())))
+        dedup[key] = (t, p)
+    grids = list(dedup.values())
+    if max_variants > 0 and len(grids) > max_variants:
+        idxs = np.linspace(0, len(grids) - 1, num=max_variants, dtype=int).tolist()
+        grids = [grids[i] for i in idxs]
+
     total = max(1, len(grids))
 
     for idx, (t, params) in enumerate(grids, start=1):

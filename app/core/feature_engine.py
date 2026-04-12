@@ -282,6 +282,39 @@ def add_ichimoku_features(df: pd.DataFrame) -> list[str]:
     return ["ichimoku_conv_9", "ichimoku_base_26", "ichimoku_span_a", "ichimoku_span_b"]
 
 
+def add_supertrend_features(df: pd.DataFrame) -> list[str]:
+    _, atr = compute_atr(df["high"], df["low"], df["close"], 10)
+    hl2 = (df["high"] + df["low"]) / 2.0
+    upper = hl2 + 3.0 * atr
+    lower = hl2 - 3.0 * atr
+    trend = np.where(df["close"] >= hl2, 1.0, -1.0)
+    df["supertrend_upper_10_3"] = upper
+    df["supertrend_lower_10_3"] = lower
+    df["supertrend_trend_10_3"] = trend
+    return ["supertrend_upper_10_3", "supertrend_lower_10_3", "supertrend_trend_10_3"]
+
+
+def add_fractal_features(df: pd.DataFrame) -> list[str]:
+    hh = df["high"]
+    ll = df["low"]
+    up = ((hh.shift(2) < hh) & (hh.shift(1) < hh) & (hh.shift(-1) < hh) & (hh.shift(-2) < hh)).astype(float)
+    down = ((ll.shift(2) > ll) & (ll.shift(1) > ll) & (ll.shift(-1) > ll) & (ll.shift(-2) > ll)).astype(float)
+    df["fractal_up"] = up.fillna(0.0)
+    df["fractal_down"] = down.fillna(0.0)
+    return ["fractal_up", "fractal_down"]
+
+
+def add_microstructure_features(df: pd.DataFrame) -> list[str]:
+    spread_proxy = (df["high"] - df["low"]) / df["close"].replace(0, np.nan)
+    body = (df["close"] - df["open"]).abs() / df["close"].replace(0, np.nan)
+    churn = df["volume"] * spread_proxy
+    df["spread_proxy"] = spread_proxy
+    df["body_proxy"] = body
+    df["volume_churn"] = churn
+    df["churn_z_50"] = (churn - churn.rolling(50).mean()) / churn.rolling(50).std().replace(0, np.nan)
+    return ["spread_proxy", "body_proxy", "volume_churn", "churn_z_50"]
+
+
 FEATURE_BUILDERS.update({
     "VWAP": add_vwap_features,
     "MOMENTUM": add_momentum_features,
@@ -296,6 +329,9 @@ FEATURE_BUILDERS.update({
     "OBV": add_obv_features,
     "CMF": add_cmf_features,
     "ICHIMOKU": add_ichimoku_features,
+    "SUPERTREND": add_supertrend_features,
+    "FRACTAL": add_fractal_features,
+    "MICROSTRUCTURE": add_microstructure_features,
 })
 
 def generate_features(df: pd.DataFrame, selected_features: list[str]):

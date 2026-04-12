@@ -10,8 +10,8 @@
 5. Go to **AI Lab**.
 6. Select timeframe (start with **1m** for fastest workflow).
 7. Keep defaults first run:
-   - Population = 8
-   - Generations = 2
+   - Population = 24
+   - Generations = 12
    - Auto mode = ON
 8. Click **Start**.
 
@@ -22,8 +22,8 @@ This build now updates timeline continuously and uses automatic downsampling for
 
 If runs are still heavy:
 - Use **1m** or **5m** timeframe first.
-- Keep **Population <= 8**.
-- Keep **Generations <= 2**.
+- Keep **Population <= 24**.
+- Keep **Generations <= 12**.
 - Keep all feature groups enabled first run; then reduce if needed.
 
 Also check the timeline table and log panel for active stage updates.
@@ -36,14 +36,14 @@ Also check the timeline table and log panel for active stage updates.
 - **Stop**: graceful cancel request
 - **AI-Only Quick Run**: only regime/confidence model analysis
 - **Open Live Monitor**: opens a dedicated real-time run window showing candidate test progress, generation evolution, and live engine logs
-- **Neural Network Window**: opens automatically on run and displays architecture + live epoch loss/accuracy curves
+- **Neural Network Window**: opens automatically on run and displays architecture + topology map + live epoch chips + generation/candidate context
 
 Settings:
 - **Timeframe**: dataset slice resolution used for run
 - **Population**: top candidates kept per generation sweep
 - **Generations**: number of evolution rounds
 - **Feature toggles**: indicator/feature groups used in auto feature engineering
-  - Includes expanded groups: VWAP, Momentum, Order Flow, Z-Score, Donchian, Stochastic, Keltner, ADX, CCI, Williams %R, OBV, CMF, Ichimoku
+  - Includes expanded groups: VWAP, Momentum, Order Flow, Z-Score, Donchian, Stochastic, Keltner, ADX, CCI, Williams %R, OBV, CMF, Ichimoku, Supertrend, Fractal, Microstructure
 
 ---
 
@@ -53,7 +53,7 @@ Settings:
 2. **Feature engineering**
    - selected groups generated automatically
 3. **Strategy evolution**
-   - template variants tested, scored, and ranked
+   - template variants tested, scored, and ranked (base grid + seeded mutations from prior winners)
    - best candidate per generation retained
 4. **Validation**
    - walk-forward stability score computed
@@ -126,6 +126,6 @@ It does **not** perform live execution.
 ---
 
 ## 9) Suggested next tuning for your machine
-- Fast machine: Population 12, Generations 4
-- Mid machine: Population 8, Generations 2
-- Conservative machine: Population 6, Generations 1
+- Fast machine: Population 48+, Generations 20+
+- Mid machine: Population 24, Generations 12
+- Conservative machine: Population 12, Generations 6
