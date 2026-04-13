@@ -35,6 +35,7 @@ class ResearchWorker(QObject):
         self.population_top_k = population_top_k
         self.model_type = model_type
         self._cancel = False
+        self.mutation_bias: dict[str, float] = {}
 
     @Slot()
     def cancel(self):
@@ -57,15 +58,16 @@ class ResearchWorker(QObject):
         vol_conf = float((context or {}).get("ctx_volatility_confidence", 0.0) or 0.0)
         sample_count = max(1.0, float((context or {}).get("ctx_sample_count", 0.0) or 1.0))
         return_scale = max(1e-9, float((context or {}).get("ctx_return_scale", 0.0) or 1e-9))
-
+    
         template_regime = "trend-following"
         if "breakout" in key or "breakout" in inds or "donchian" in inds:
             template_regime = "breakout"
         elif "reversal" in key or "mean" in key or "rsi" in inds or "zscore" in inds:
             template_regime = "mean-reversion"
-
+    
         min_required_conf = 1.0 / (1.0 + np.sqrt(sample_count))
         adaptive_gap = return_scale / np.sqrt(sample_count)
+    
         if max(trend_conf, vol_conf) < min_required_conf:
             return "uncertain"
         if observed_tr - observed_rg > adaptive_gap:
@@ -225,6 +227,7 @@ class ResearchWorker(QObject):
                     max_variants=180,
                     exploration_strength=max(0.1, 1.0 - ((gen - 1) / max(1, self.generations - 1))),
                     mutation_only_from_seed=(gen > 1),
+                    mutation_bias=self.mutation_bias,
                 )
                 if top_variants.empty:
                     raise RuntimeError("No strategy variants generated")
@@ -506,6 +509,7 @@ class AppState(QObject):
         self._elite_pool: dict[str, dict] = {}
         self._strategy_perf_index: dict[str, float] = {}
         self._mutation_feedback: dict[str, dict] = {}
+        self._mutation_bias: dict[str, float] = {}
 
     @Property("QVariantList", notify=strategiesChanged)
     def strategies(self):
@@ -778,6 +782,7 @@ class AppState(QObject):
         self._elite_pool = {}
         self._strategy_perf_index = {}
         self._mutation_feedback = {}
+        self._mutation_bias = {}
         self.strategiesChanged.emit()
         self.selectedStrategyChanged.emit()
         self.fitnessSeriesChanged.emit()
@@ -1127,6 +1132,53 @@ class AppState(QObject):
                 stat["last_parent_perf"] = float(parent_perf)
                 stat["last_child_perf"] = child_perf
                 self._mutation_feedback[mutation_type] = stat
+
+                # Rebuild adaptive mutation bias from accumulated mutation feedback.
+                raw_bias: dict[str, float] = {}
+                for mtype, fb in self._mutation_feedback.items():
+                    count = int(fb.get("count", 0) or 0)
+                    if count <= 0:
+                        continue
+
+                    avg_improvement = float(fb.get("avg_improvement", 0.0) or 0.0)
+                    improved = int(fb.get("improved", 0) or 0)
+                    success_rate = improved / max(1, count)
+
+                    # Confidence grows with sample count but saturates smoothly.
+                    confidence = np.sqrt(count) / (np.sqrt(count) + 3.0)
+
+                    # Improvement signal: compress to avoid one mutation type dominating
+                    # just because of a few large raw wins.
+                    improvement_signal = np.tanh(avg_improvement / 5.0)
+                    improvement_signal = (improvement_signal + 1.0) / 2.0
+
+                    # Success signal already in [0, 1].
+                    success_signal = float(np.clip(success_rate, 0.0, 1.0))
+
+                    # Blend both signals, then scale by confidence so low-sample
+                    # mutation types do not overreact.
+                    adjusted_score = (0.55 * improvement_signal + 0.45 * success_signal) * confidence
+                    raw_bias[mtype] = max(1e-6, adjusted_score)
+
+                if raw_bias:
+                    total_raw = float(sum(raw_bias.values()))
+                    normalized = {
+                        mtype: (value / total_raw) for mtype, value in raw_bias.items()
+                    }
+
+                    # Exploration floor: no mutation path can disappear completely.
+                    floor = 0.10
+                    floored = {
+                        mtype: max(floor, value) for mtype, value in normalized.items()
+                    }
+
+                    total_floored = float(sum(floored.values()))
+                    self._mutation_bias = {
+                        mtype: (value / total_floored) for mtype, value in floored.items()
+                    }
+                    self._append_log("INFO", f"Mutation bias updated: {self._mutation_bias}")
+                    if self._worker is not None:
+                        self._worker.mutation_bias = dict(self._mutation_bias)
 
         replaced = False
         for i, existing in enumerate(self._strategies):
