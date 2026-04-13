@@ -481,6 +481,8 @@ class AppState(QObject):
 
         self._thread: QThread | None = None
         self._worker: ResearchWorker | None = None
+        self._rank_tick = 0
+        self._rank_tracker: dict[str, dict] = {}
 
     @Property("QVariantList", notify=strategiesChanged)
     def strategies(self):
@@ -748,6 +750,8 @@ class AppState(QObject):
         self._val_accuracy_series = []
         self._regime_counts = {}
         self._feature_importance = {}
+        self._rank_tick = 0
+        self._rank_tracker = {}
         self.strategiesChanged.emit()
         self.selectedStrategyChanged.emit()
         self.fitnessSeriesChanged.emit()
@@ -852,11 +856,85 @@ class AppState(QObject):
         return round(pnl * 1.0 + win_rate * 0.35 - drawdown * 0.75 + stability_bonus, 4)
 
     def _resort_and_rank_strategies(self):
+        if not self._strategies:
+            return
+        self._rank_tick += 1
         for row in self._strategies:
             row["score"] = self._compute_strategy_score(row)
         self._strategies.sort(key=lambda r: float(r.get("score", 0.0)), reverse=True)
         for i, row in enumerate(self._strategies, start=1):
             row["rank"] = i
+
+        n = len(self._strategies)
+        scores = np.array([float(r.get("score", 0.0)) for r in self._strategies], dtype=float)
+        score_std = float(np.std(scores, ddof=0))
+        score_median = float(np.median(scores))
+        top_score = float(scores[0])
+        robust_vals = np.array([float(r.get("behavior_robustness", 0.0)) for r in self._strategies], dtype=float)
+        robust_median = float(np.median(robust_vals))
+        top_n = max(1, int(np.sqrt(n)))
+
+        for row in self._strategies:
+            rank = int(row.get("rank", n))
+            pct = 1.0 if n <= 1 else float((n - rank) / (n - 1))
+            row["percentile_rank"] = round(pct, 4)
+            row["score_from_median"] = round(float(row["score"]) - score_median, 4)
+            row["score_gap_to_top"] = round(top_score - float(row["score"]), 4)
+
+            sid = str(row.get("id", ""))
+            track = self._rank_tracker.get(sid, {"updates": 0, "rank_sum": 0.0, "rank_sq_sum": 0.0, "top_hits": 0})
+            track["updates"] += 1
+            track["rank_sum"] += rank
+            track["rank_sq_sum"] += rank * rank
+            if rank <= top_n:
+                track["top_hits"] += 1
+            self._rank_tracker[sid] = track
+
+            upd = float(track["updates"])
+            mean_rank = track["rank_sum"] / upd
+            var_rank = max(0.0, track["rank_sq_sum"] / upd - mean_rank * mean_rank)
+            rank_std = float(np.sqrt(var_rank))
+            rank_consistency = 1.0 / (1.0 + (rank_std / (mean_rank + 1e-9)))
+            top_duration = float(track["top_hits"] / upd)
+            row["rank_stability"] = round(float(np.sqrt(max(0.0, rank_consistency * top_duration))), 4)
+
+        stability_vals = np.array([float(r.get("rank_stability", 0.0)) for r in self._strategies], dtype=float)
+        stab_median = float(np.median(stability_vals))
+        composite = []
+        for row in self._strategies:
+            score_pct = row.get("percentile_rank", 0.0)
+            robust_pct = float((robust_vals <= float(row.get("behavior_robustness", 0.0))).mean())
+            stab_pct = float((stability_vals <= float(row.get("rank_stability", 0.0))).mean())
+            dom_index = float((max(1e-9, score_pct) * max(1e-9, robust_pct) * max(1e-9, stab_pct)) ** (1.0 / 3.0))
+            row["dominance_index"] = round(dom_index, 4)
+            composite.append(dom_index)
+
+        comp = np.array(composite, dtype=float)
+        dom_std = float(np.std(comp, ddof=0))
+        dominant_id = None
+        if len(self._strategies) >= 2:
+            best = self._strategies[0]
+            second = self._strategies[1]
+            gap = float(best.get("dominance_index", 0.0) - second.get("dominance_index", 0.0))
+            if gap > dom_std and float(best.get("behavior_robustness", 0.0)) >= robust_median and float(best.get("rank_stability", 0.0)) >= stab_median:
+                dominant_id = str(best.get("id", ""))
+        for row in self._strategies:
+            row["dominant_candidate"] = str(row.get("id", "")) == dominant_id
+
+        # Diversity signal on top cohort.
+        top_rows = self._strategies[:top_n]
+        overall_unique = len({str(r.get("family", "")) for r in self._strategies})
+        top_unique = len({str(r.get("family", "")) for r in top_rows})
+        overall_div = overall_unique / max(1, n)
+        top_div = top_unique / max(1, top_n)
+        low_diversity = top_div < overall_div
+        top_family_counts: dict[str, int] = {}
+        for r in top_rows:
+            fam = str(r.get("family", ""))
+            top_family_counts[fam] = top_family_counts.get(fam, 0) + 1
+        for row in self._strategies:
+            fam = str(row.get("family", ""))
+            row["diversity_warning"] = bool(low_diversity and top_family_counts.get(fam, 0) > 1)
 
     @Slot(object)
     def _on_strategy(self, payload: object):

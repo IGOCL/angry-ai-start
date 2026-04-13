@@ -8,7 +8,7 @@ Rectangle {
     property bool selected: false
     signal clicked()
 
-    height: 162
+    height: 174
     radius: 10
     color: selected ? "#123052" : (row.rank <= 3 ? "#13263A" : (hovered ? "#111C2D" : "#0E1623"))
     border.color: selected ? "#36A3FF" : (row.rank <= 3 ? "#E6B85C" : "#1B2A41")
@@ -67,6 +67,11 @@ Rectangle {
             Label { text: "Robust " + (row.behavior_robustness || 0); color: "#D8CF8E"; font.pixelSize: 10 }
             Label { text: "Stability " + Math.round((row.time_stability || 0) * 100) + "%"; color: "#BFD98E"; font.pixelSize: 10 }
             Label { text: (row.decay_flag ? "Decay ⚠" : "Decay OK"); color: row.decay_flag ? "#F0A3A3" : "#9CC7A7"; font.pixelSize: 10 }
+        }
+        RowLayout {
+            Label { text: "Pct " + Math.round((row.percentile_rank || 0) * 100) + "%"; color: "#9FD1FF"; font.pixelSize: 10 }
+            Label { text: "RankStab " + Math.round((row.rank_stability || 0) * 100) + "%"; color: "#C7DFA2"; font.pixelSize: 10 }
+            Label { text: row.dominant_candidate ? "Dominant ★" : ""; color: "#FFD27A"; font.pixelSize: 10; font.bold: true }
         }
     }
 
