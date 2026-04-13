@@ -71,7 +71,7 @@ Rectangle {
         RowLayout {
             Label { text: "Pct " + Math.round((row.percentile_rank || 0) * 100) + "%"; color: "#9FD1FF"; font.pixelSize: 10 }
             Label { text: "RankStab " + Math.round((row.rank_stability || 0) * 100) + "%"; color: "#C7DFA2"; font.pixelSize: 10 }
-            Label { text: row.dominant_candidate ? "Dominant ★" : ""; color: "#FFD27A"; font.pixelSize: 10; font.bold: true }
+            Label { text: row.dominant_candidate ? "Dominant ★" : (row.dominant_provisional ? "Dominant? (early)" : ""); color: "#FFD27A"; font.pixelSize: 10; font.bold: true }
         }
     }
 

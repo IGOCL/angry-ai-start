@@ -866,6 +866,7 @@ class AppState(QObject):
             row["rank"] = i
 
         n = len(self._strategies)
+        population_maturity = float(1.0 - (1.0 / np.sqrt(n + 1.0)))
         scores = np.array([float(r.get("score", 0.0)) for r in self._strategies], dtype=float)
         score_std = float(np.std(scores, ddof=0))
         score_median = float(np.median(scores))
@@ -876,10 +877,15 @@ class AppState(QObject):
 
         for row in self._strategies:
             rank = int(row.get("rank", n))
-            pct = 1.0 if n <= 1 else float((n - rank) / (n - 1))
+            pct_raw = 1.0 if n <= 1 else float((n - rank) / (n - 1))
+            pct = population_maturity * pct_raw + (1.0 - population_maturity) * 0.5
+            row["population_maturity"] = round(population_maturity, 4)
+            row["percentile_rank_raw"] = round(pct_raw, 4)
             row["percentile_rank"] = round(pct, 4)
-            row["score_from_median"] = round(float(row["score"]) - score_median, 4)
-            row["score_gap_to_top"] = round(top_score - float(row["score"]), 4)
+            row["score_from_median_raw"] = round(float(row["score"]) - score_median, 4)
+            row["score_gap_to_top_raw"] = round(top_score - float(row["score"]), 4)
+            row["score_from_median"] = round(population_maturity * row["score_from_median_raw"], 4)
+            row["score_gap_to_top"] = round(population_maturity * row["score_gap_to_top_raw"], 4)
 
             sid = str(row.get("id", ""))
             track = self._rank_tracker.get(sid, {"updates": 0, "rank_sum": 0.0, "rank_sq_sum": 0.0, "top_hits": 0})
@@ -896,7 +902,9 @@ class AppState(QObject):
             rank_std = float(np.sqrt(var_rank))
             rank_consistency = 1.0 / (1.0 + (rank_std / (mean_rank + 1e-9)))
             top_duration = float(track["top_hits"] / upd)
-            row["rank_stability"] = round(float(np.sqrt(max(0.0, rank_consistency * top_duration))), 4)
+            raw_stability = float(np.sqrt(max(0.0, rank_consistency * top_duration)))
+            row["rank_stability_raw"] = round(raw_stability, 4)
+            row["rank_stability"] = round(population_maturity * raw_stability + (1.0 - population_maturity) * 0.5, 4)
 
         stability_vals = np.array([float(r.get("rank_stability", 0.0)) for r in self._strategies], dtype=float)
         stab_median = float(np.median(stability_vals))
@@ -916,10 +924,14 @@ class AppState(QObject):
             best = self._strategies[0]
             second = self._strategies[1]
             gap = float(best.get("dominance_index", 0.0) - second.get("dominance_index", 0.0))
-            if gap > dom_std and float(best.get("behavior_robustness", 0.0)) >= robust_median and float(best.get("rank_stability", 0.0)) >= stab_median:
+            gap_strength = gap / (dom_std + 1e-9)
+            dominance_conf = (gap_strength / (1.0 + abs(gap_strength))) * population_maturity
+            population_baseline = float(np.mean(comp))
+            if gap > dom_std and float(best.get("behavior_robustness", 0.0)) >= robust_median and float(best.get("rank_stability", 0.0)) >= stab_median and dominance_conf > population_baseline:
                 dominant_id = str(best.get("id", ""))
         for row in self._strategies:
             row["dominant_candidate"] = str(row.get("id", "")) == dominant_id
+            row["dominant_provisional"] = bool(str(row.get("id", "")) == str(self._strategies[0].get("id", "")) and dominant_id is None and n > 1 and population_maturity < float(np.mean(comp)))
 
         # Diversity signal on top cohort.
         top_rows = self._strategies[:top_n]
