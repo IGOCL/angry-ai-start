@@ -938,23 +938,35 @@ class AppState(QObject):
             [float((robust_vals <= float(r.get("behavior_robustness", 0.0))).mean()) for r in self._strategies],
             dtype=float,
         )
+        robust_raw_vals = np.array(
+            [float(np.clip(float(r.get("behavior_robustness", 0.0)) / 100.0, 0.0, 1.0)) for r in self._strategies],
+            dtype=float,
+        )
         conf_vals = np.array([float(r.get("context_confidence", 0.0)) for r in self._strategies], dtype=float)
         conf_pct_vals = np.array([float((conf_vals <= float(v)).mean()) for v in conf_vals], dtype=float)
+        conf_raw_vals = np.array([float(np.clip(v, 0.0, 1.0)) for v in conf_vals], dtype=float)
         decay_penalties = np.array(
             [float(r.get("decay_score", 0.0)) if bool(r.get("decay_flag", False)) else 0.0 for r in self._strategies],
             dtype=float,
         )
-        decay_good_vals = 1.0 - np.clip(decay_penalties * population_maturity, 0.0, 1.0)
-        health = 0.4 * robust_pct_vals + 0.4 * conf_pct_vals + 0.2 * decay_good_vals
+        decay_effect_scale = 0.5 + 0.5 * population_maturity
+        decay_good_vals = 1.0 - np.clip(decay_penalties * decay_effect_scale, 0.0, 1.0)
+        robust_signal = 0.5 * robust_pct_vals + 0.5 * robust_raw_vals
+        conf_signal = 0.5 * conf_pct_vals + 0.5 * conf_raw_vals
+        health = 0.4 * robust_signal + 0.4 * conf_signal + 0.2 * decay_good_vals
         q_filtered = min(0.49, population_maturity * population_maturity * 0.5)
         q_weak = min(0.85, (population_maturity * 0.5) + q_filtered)
-        filtered_cut = float(np.quantile(health, q_filtered)) if len(health) else 0.0
-        weak_cut = float(np.quantile(health, q_weak)) if len(health) else 0.0
+        n_total = len(health)
+        filtered_n = int(np.floor(q_filtered * n_total))
+        weak_n = int(np.floor(q_weak * n_total))
+        order = np.argsort(health)  # low health first
+        filtered_set = set(order[:filtered_n].tolist())
+        weak_set = set(order[filtered_n:weak_n].tolist())
         for i, row in enumerate(self._strategies):
             h = float(health[i])
-            if h <= filtered_cut:
+            if i in filtered_set:
                 row["survival_status"] = "filtered"
-            elif h <= weak_cut:
+            elif i in weak_set:
                 row["survival_status"] = "weak"
             else:
                 row["survival_status"] = "active"
