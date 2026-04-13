@@ -334,10 +334,26 @@ FEATURE_BUILDERS.update({
     "MICROSTRUCTURE": add_microstructure_features,
 })
 
-def generate_features(df: pd.DataFrame, selected_features: list[str]):
+def generate_features(
+    df: pd.DataFrame,
+    selected_features: list[str],
+    progress_cb=None,
+    cooperative_cb=None,
+):
     out = ensure_sorted(df.copy())
     generated_cols: list[str] = []
-    for feature_name in selected_features:
+    total = max(1, len(selected_features))
+    for idx, feature_name in enumerate(selected_features, start=1):
+        if cooperative_cb is not None:
+            try:
+                cooperative_cb("feature_generation", idx, total, feature_name)
+            except Exception:
+                pass
+        if progress_cb is not None:
+            try:
+                progress_cb(idx, total, feature_name)
+            except Exception:
+                pass
         builder = FEATURE_BUILDERS.get(feature_name.upper())
         if builder is None:
             continue

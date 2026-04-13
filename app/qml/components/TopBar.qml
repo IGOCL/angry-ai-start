@@ -50,6 +50,33 @@ Rectangle {
         Button { text: "Pause"; onClicked: { appState.logUiEvent("Pause clicked"); root.pauseClicked() } }
         Button { text: "Stop"; onClicked: { appState.logUiEvent("Stop clicked"); root.stopClicked() } }
 
+        Label { text: "RAM GB"; color: "#9FB6CF"; font.pixelSize: 11 }
+        SpinBox {
+            id: ramLimitBox
+            from: 1
+            to: 128
+            value: Math.round(appState.maxRamGb)
+            editable: true
+            Layout.preferredWidth: 70
+            onValueModified: appState.setMaxRamGb(value)
+        }
+
+        Label { text: "CPU %"; color: "#9FB6CF"; font.pixelSize: 11 }
+        Slider {
+            id: cpuSlider
+            from: 0
+            to: 95
+            stepSize: 5
+            value: appState.cpuThrottle
+            Layout.preferredWidth: 90
+            onMoved: appState.setCpuThrottle(Math.round(value))
+        }
+        Label {
+            text: appState.cpuThrottle + "%"
+            color: "#BEE0FF"
+            font.pixelSize: 11
+        }
+
         Rectangle {
             radius: 10
             color: "#132238"

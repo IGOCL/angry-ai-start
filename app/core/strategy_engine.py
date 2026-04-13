@@ -616,6 +616,8 @@ def walk_forward_validate(
     params: dict[str, Any] | None = None,
     config: BacktestConfig | None = None,
     folds: int = 4,
+    progress_cb=None,
+    cooperative_cb=None,
 ) -> tuple[pd.DataFrame, float]:
     if df is None or df.empty:
         raise ValueError("Dataset is empty")
@@ -627,6 +629,16 @@ def walk_forward_validate(
     rows = []
 
     for i in range(folds):
+        if cooperative_cb is not None:
+            try:
+                cooperative_cb("validation", i + 1, folds, "walk_forward_fold")
+            except Exception:
+                pass
+        if progress_cb is not None:
+            try:
+                progress_cb(i + 1, folds, "walk_forward_fold")
+            except Exception:
+                pass
         start = i * fold_size
         end = min(len(staged), start + fold_size)
         if end - start < 50:
@@ -824,6 +836,7 @@ def evolve_templates(
     exploration_strength: float = 0.0,
     mutation_only_from_seed: bool = False,
     mutation_bias: dict[str, float] | None = None,
+    cooperative_cb=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     cfg = config or BacktestConfig()
     all_rows: list[dict[str, Any]] = []
@@ -927,6 +940,11 @@ def evolve_templates(
     total = max(1, len(grids))
 
     for idx, g in enumerate(grids, start=1):
+        if cooperative_cb is not None:
+            try:
+                cooperative_cb("strategy_evolution", idx, total, str(g.get("mutation_type", "variant")))
+            except Exception:
+                pass
         t = g["template"]
         params = g["params"]
         if progress_cb is not None and (idx == 1 or idx % 3 == 0 or idx == total):

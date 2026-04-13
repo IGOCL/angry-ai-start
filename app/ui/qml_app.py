@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import hashlib
 import sys
+import time
+from pathlib import Path
 from urllib.parse import unquote, urlparse
 from dataclasses import asdict
-from pathlib import Path
 
 import pandas as pd
 import numpy as np
@@ -20,6 +21,63 @@ from app.core.strategy_engine import evolve_templates, walk_forward_validate, TE
 from app.core.chart_adapter import build_candle_payload
 
 
+class ResourceController:
+    def __init__(self, ram_limit_gb: float, cpu_throttle: int, log_cb=None, stage_cb=None):
+        self.ram_limit_gb = max(0.25, float(ram_limit_gb))
+        self.cpu_throttle = max(0, min(95, int(cpu_throttle)))
+        self.log_cb = log_cb
+        self.stage_cb = stage_cb
+        self._last_log_ts = 0.0
+        self._last_stage_ts = 0.0
+
+    def update(self, ram_limit_gb: float, cpu_throttle: int):
+        self.ram_limit_gb = max(0.25, float(ram_limit_gb))
+        self.cpu_throttle = max(0, min(95, int(cpu_throttle)))
+
+    def memory_usage_gb(self) -> float:
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("VmRSS:"):
+                        kb = float(line.split()[1])
+                        return kb / (1024.0 * 1024.0)
+        except Exception:
+            pass
+        return 0.0
+
+    def cooperative_yield(self, stage: str, current: int, total: int, detail: str = ""):
+        throttle = max(0.0, self.cpu_throttle / 100.0)
+        if throttle > 0:
+            base_delay = 0.001 + (0.024 * throttle)
+            if current % max(1, int(2 + 18 * (1.0 - throttle))) == 0:
+                time.sleep(base_delay)
+
+        mem_gb = self.memory_usage_gb()
+        high_watermark = self.ram_limit_gb * 0.90
+        over_limit = mem_gb >= self.ram_limit_gb
+        near_limit = mem_gb >= high_watermark
+        if near_limit:
+            extra_delay = 0.020 if over_limit else 0.010
+            time.sleep(extra_delay)
+            now = time.time()
+            if self.log_cb is not None and now - self._last_log_ts > 1.0:
+                status = "exceeded" if over_limit else "near"
+                self.log_cb(
+                    "WARN",
+                    f"RAM limiter active ({status} limit): usage={mem_gb:.2f}GB limit={self.ram_limit_gb:.2f}GB stage={stage}",
+                )
+                self._last_log_ts = now
+
+        now = time.time()
+        if self.stage_cb is not None and (current <= 1 or current >= total or now - self._last_stage_ts > 0.35):
+            pct = int((current / max(1, total)) * 100) if total > 0 else 0
+            suffix = f" [{current:,}/{max(1, total):,} | {pct}%]"
+            if detail:
+                suffix += f" {detail}"
+            self.stage_cb(f"{stage}{suffix}")
+            self._last_stage_ts = now
+
+
 class ResearchWorker(QObject):
     log = Signal(str, str)
     strategy = Signal(object)
@@ -28,14 +86,22 @@ class ResearchWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, dataset_path: str, generations: int, population_top_k: int, model_type: str):
+    def __init__(
+        self,
+        dataset_path: str,
+        generations: int,
+        population_top_k: int,
+        model_type: str,
+        max_ram_gb: float = 4.0,
+        cpu_throttle: int = 0,
+    ):
         super().__init__()
         self.dataset_path = dataset_path
         self.generations = generations
         self.population_top_k = population_top_k
         self.model_type = model_type
         self._cancel = False
-        self.mutation_bias: dict[str, float] = {}
+        self._resources = ResourceController(max_ram_gb, cpu_throttle, log_cb=self.log.emit, stage_cb=self.stage.emit)
 
     @Slot()
     def cancel(self):
@@ -58,16 +124,15 @@ class ResearchWorker(QObject):
         vol_conf = float((context or {}).get("ctx_volatility_confidence", 0.0) or 0.0)
         sample_count = max(1.0, float((context or {}).get("ctx_sample_count", 0.0) or 1.0))
         return_scale = max(1e-9, float((context or {}).get("ctx_return_scale", 0.0) or 1e-9))
-    
+
         template_regime = "trend-following"
         if "breakout" in key or "breakout" in inds or "donchian" in inds:
             template_regime = "breakout"
         elif "reversal" in key or "mean" in key or "rsi" in inds or "zscore" in inds:
             template_regime = "mean-reversion"
-    
+
         min_required_conf = 1.0 / (1.0 + np.sqrt(sample_count))
         adaptive_gap = return_scale / np.sqrt(sample_count)
-    
         if max(trend_conf, vol_conf) < min_required_conf:
             return "uncertain"
         if observed_tr - observed_rg > adaptive_gap:
@@ -112,7 +177,20 @@ class ResearchWorker(QObject):
 
             self.stage.emit("Dataset load")
             self.log.emit("INFO", "dataset load started")
-            df, profile = load_market_file_minimal(self.dataset_path)
+            load_started_at = time.perf_counter()
+
+            def _load_progress(rows_loaded: int, total_rows: int, detail: str):
+                self._resources.cooperative_yield("Dataset load", max(1, rows_loaded), max(1, total_rows or rows_loaded), detail)
+                if rows_loaded % 200000 == 0:
+                    elapsed = max(1e-9, time.perf_counter() - load_started_at)
+                    self.log.emit("INFO", f"dataset load progress: rows={rows_loaded:,} speed={int(rows_loaded/elapsed):,}/s")
+
+            df, profile = load_market_file_minimal(
+                self.dataset_path,
+                progress_cb=_load_progress,
+                cancel_cb=lambda: self._cancel,
+                chunk_size=150_000,
+            )
             self.log.emit("INFO", f"dataset ready: rows={len(df):,} synthetic={profile.synthetic_pct:.2f}%")
             if self._cancel:
                 return
@@ -122,7 +200,15 @@ class ResearchWorker(QObject):
             selected_features = [
                 "EMA", "RSI", "MACD", "ATR", "BOLLINGER", "VWAP", "MOMENTUM", "ORDER_FLOW", "BREAKOUT",
             ]
-            featured_df, generated_cols = generate_features(df, selected_features)
+            def _feature_progress(idx: int, total: int, feature_name: str):
+                self._resources.cooperative_yield("Feature generation", idx, total, feature_name)
+
+            featured_df, generated_cols = generate_features(
+                df,
+                selected_features,
+                progress_cb=_feature_progress,
+                cooperative_cb=_feature_progress,
+            )
             self.log.emit("INFO", f"feature generation completed: generated={len(generated_cols)}")
             if self._cancel:
                 return
@@ -223,11 +309,12 @@ class ResearchWorker(QObject):
                     working_df,
                     top_k=self.population_top_k,
                     result_cb=_emit_streamed_variant,
+                    progress_cb=lambda idx, total, name: self._resources.cooperative_yield("Backtesting", idx, total, name),
                     seed_pool=seed_pool,
                     max_variants=180,
                     exploration_strength=max(0.1, 1.0 - ((gen - 1) / max(1, self.generations - 1))),
                     mutation_only_from_seed=(gen > 1),
-                    mutation_bias=self.mutation_bias,
+                    cooperative_cb=lambda stage, idx, total, detail: self._resources.cooperative_yield("Evolution", idx, total, detail),
                 )
                 if top_variants.empty:
                     raise RuntimeError("No strategy variants generated")
@@ -345,6 +432,8 @@ class ResearchWorker(QObject):
                     template_key=str(vrow["template_key"]),
                     params=params,
                     folds=4,
+                    progress_cb=lambda idx, total, name: self._resources.cooperative_yield("Validation", idx, total, name),
+                    cooperative_cb=lambda stage, idx, total, detail: self._resources.cooperative_yield("Validation", idx, total, detail),
                 )
                 sig = f"{vrow['template_key']}|{json.dumps(params, sort_keys=True)}"
                 strategy_id = f"G{self.generations}-{hashlib.md5(sig.encode('utf-8')).hexdigest()[:10]}"
@@ -402,6 +491,7 @@ class ResearchWorker(QObject):
             self.log.emit("INFO", "AI analysis started")
 
             def _epoch_cb(epoch, total, loss, acc, extra):
+                self._resources.cooperative_yield("AI analysis", int(epoch), int(total), "training")
                 payload = {
                     "epoch": int(epoch),
                     "total": int(total),
@@ -471,6 +561,8 @@ class AppState(QObject):
     previewRowsChanged = Signal()
     previewColumnsChanged = Signal()
     featureMetaChanged = Signal()
+    maxRamGbChanged = Signal()
+    cpuThrottleChanged = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -501,6 +593,8 @@ class AppState(QObject):
         self._feature_preview_rows: list[dict] = []
         self._feature_row_count = 0
         self._generated_feature_count = 0
+        self._max_ram_gb = 4.0
+        self._cpu_throttle = 20
 
         self._thread: QThread | None = None
         self._worker: ResearchWorker | None = None
@@ -509,7 +603,14 @@ class AppState(QObject):
         self._elite_pool: dict[str, dict] = {}
         self._strategy_perf_index: dict[str, float] = {}
         self._mutation_feedback: dict[str, dict] = {}
-        self._mutation_bias: dict[str, float] = {}
+
+    @Property(float, notify=maxRamGbChanged)
+    def maxRamGb(self):
+        return float(self._max_ram_gb)
+
+    @Property(int, notify=cpuThrottleChanged)
+    def cpuThrottle(self):
+        return int(self._cpu_throttle)
 
     @Property("QVariantList", notify=strategiesChanged)
     def strategies(self):
@@ -635,6 +736,24 @@ class AppState(QObject):
         if normalized:
             self._append_log("UI", f"Dataset path set: {normalized}")
 
+    @Slot(float)
+    def setMaxRamGb(self, value: float):
+        next_value = float(max(0.25, min(128.0, value)))
+        if abs(next_value - self._max_ram_gb) < 1e-9:
+            return
+        self._max_ram_gb = next_value
+        self.maxRamGbChanged.emit()
+        self._append_log("UI", f"RAM limit set to {self._max_ram_gb:.2f} GB")
+
+    @Slot(int)
+    def setCpuThrottle(self, value: int):
+        next_value = int(max(0, min(95, int(value))))
+        if next_value == self._cpu_throttle:
+            return
+        self._cpu_throttle = next_value
+        self.cpuThrottleChanged.emit()
+        self._append_log("UI", f"CPU throttle set to {self._cpu_throttle}%")
+
 
     @Slot()
     def loadDataset(self):
@@ -642,7 +761,21 @@ class AppState(QObject):
             if not self._dataset_path:
                 raise ValueError("No dataset selected")
             self._append_log("INFO", f"Loading dataset from: {self._dataset_path}")
-            df, profile = load_market_file_minimal(self._dataset_path)
+            resources = ResourceController(self._max_ram_gb, self._cpu_throttle, log_cb=self._append_log, stage_cb=self._set_stage)
+            started_at = time.perf_counter()
+
+            def _progress(rows_loaded: int, total_rows: int, detail: str):
+                resources.cooperative_yield("Dataset load", max(1, rows_loaded), max(1, total_rows or rows_loaded), detail)
+                QGuiApplication.processEvents()
+                if rows_loaded % 200000 == 0:
+                    elapsed = max(1e-9, time.perf_counter() - started_at)
+                    self._append_log("INFO", f"dataset load progress: rows={rows_loaded:,} speed={int(rows_loaded/elapsed):,}/s")
+
+            df, profile = load_market_file_minimal(
+                self._dataset_path,
+                progress_cb=_progress,
+                chunk_size=150_000,
+            )
             self._base_df = df
             self._profile = asdict(profile)
             self._preview_columns = list(df.columns)
@@ -677,7 +810,18 @@ class AppState(QObject):
                 "VWAP", "MOMENTUM", "ORDER_FLOW", "ZSCORE",
             ]
             self._append_log("INFO", "Generating features from loaded dataset")
-            feature_df, generated_cols = generate_features(self._base_df, groups)
+            resources = ResourceController(self._max_ram_gb, self._cpu_throttle, log_cb=self._append_log, stage_cb=self._set_stage)
+
+            def _feature_progress(idx: int, total: int, feature_name: str):
+                resources.cooperative_yield("Feature generation", idx, total, feature_name)
+                QGuiApplication.processEvents()
+
+            feature_df, generated_cols = generate_features(
+                self._base_df,
+                groups,
+                progress_cb=_feature_progress,
+                cooperative_cb=_feature_progress,
+            )
             self._feature_df = feature_df
             self._feature_columns = list(feature_df.columns)
             self._feature_preview_rows = feature_df.head(20).astype(str).to_dict("records")
@@ -782,7 +926,6 @@ class AppState(QObject):
         self._elite_pool = {}
         self._strategy_perf_index = {}
         self._mutation_feedback = {}
-        self._mutation_bias = {}
         self.strategiesChanged.emit()
         self.selectedStrategyChanged.emit()
         self.fitnessSeriesChanged.emit()
@@ -801,7 +944,14 @@ class AppState(QObject):
         self._set_stage("Preparing")
 
         self._thread = QThread()
-        self._worker = ResearchWorker(self._dataset_path, generations=4, population_top_k=10, model_type="mlp")
+        self._worker = ResearchWorker(
+            self._dataset_path,
+            generations=4,
+            population_top_k=10,
+            model_type="mlp",
+            max_ram_gb=self._max_ram_gb,
+            cpu_throttle=self._cpu_throttle,
+        )
         self._worker.moveToThread(self._thread)
 
         self._thread.started.connect(self._worker.run)
@@ -1132,53 +1282,6 @@ class AppState(QObject):
                 stat["last_parent_perf"] = float(parent_perf)
                 stat["last_child_perf"] = child_perf
                 self._mutation_feedback[mutation_type] = stat
-
-                # Rebuild adaptive mutation bias from accumulated mutation feedback.
-                raw_bias: dict[str, float] = {}
-                for mtype, fb in self._mutation_feedback.items():
-                    count = int(fb.get("count", 0) or 0)
-                    if count <= 0:
-                        continue
-
-                    avg_improvement = float(fb.get("avg_improvement", 0.0) or 0.0)
-                    improved = int(fb.get("improved", 0) or 0)
-                    success_rate = improved / max(1, count)
-
-                    # Confidence grows with sample count but saturates smoothly.
-                    confidence = np.sqrt(count) / (np.sqrt(count) + 3.0)
-
-                    # Improvement signal: compress to avoid one mutation type dominating
-                    # just because of a few large raw wins.
-                    improvement_signal = np.tanh(avg_improvement / 5.0)
-                    improvement_signal = (improvement_signal + 1.0) / 2.0
-
-                    # Success signal already in [0, 1].
-                    success_signal = float(np.clip(success_rate, 0.0, 1.0))
-
-                    # Blend both signals, then scale by confidence so low-sample
-                    # mutation types do not overreact.
-                    adjusted_score = (0.55 * improvement_signal + 0.45 * success_signal) * confidence
-                    raw_bias[mtype] = max(1e-6, adjusted_score)
-
-                if raw_bias:
-                    total_raw = float(sum(raw_bias.values()))
-                    normalized = {
-                        mtype: (value / total_raw) for mtype, value in raw_bias.items()
-                    }
-
-                    # Exploration floor: no mutation path can disappear completely.
-                    floor = 0.10
-                    floored = {
-                        mtype: max(floor, value) for mtype, value in normalized.items()
-                    }
-
-                    total_floored = float(sum(floored.values()))
-                    self._mutation_bias = {
-                        mtype: (value / total_floored) for mtype, value in floored.items()
-                    }
-                    self._append_log("INFO", f"Mutation bias updated: {self._mutation_bias}")
-                    if self._worker is not None:
-                        self._worker.mutation_bias = dict(self._mutation_bias)
 
         replaced = False
         for i, existing in enumerate(self._strategies):
