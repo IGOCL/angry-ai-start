@@ -31,6 +31,10 @@ Item {
                     Label { text: "Mutation tiers: active"; color: "#A1C7EB" }
                     Label { text: "Stagnation guard: on"; color: "#A1C7EB" }
                     Label { text: "Gen " + appState.currentGeneration + " / " + appState.totalGenerations; color: "#8FD3FF"; font.bold: true }
+                    Label { text: "Chunk " + (appState.currentChunk > 0 ? appState.currentChunk : "n/a") + " / " + (appState.totalChunks > 0 ? appState.totalChunks : "n/a"); color: "#A1C7EB" }
+                    Label { text: "Candidate " + (appState.currentCandidate > 0 ? appState.currentCandidate : "n/a") + " / " + (appState.totalCandidates > 0 ? appState.totalCandidates : "n/a"); color: "#A1C7EB" }
+                    Label { text: "Rows Processed: " + (appState.rowsProcessedLive > 0 ? appState.rowsProcessedLive : "n/a"); color: "#A1C7EB" }
+                    Label { text: "Active Template: " + (appState.activeTemplateName && appState.activeTemplateName.length > 0 ? appState.activeTemplateName : "n/a"); color: "#A1C7EB" }
                     Label { text: "Candidates: " + appState.candidateCount; color: "#A1C7EB" }
                     Label { text: "Evaluated: " + appState.evaluatedCount; color: "#A1C7EB" }
                     Label { text: "Survived: " + appState.survivedCount; color: "#A1C7EB" }

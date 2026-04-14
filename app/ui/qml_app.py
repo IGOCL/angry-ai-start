@@ -20,7 +20,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 from app.core.ai_engine import analyze_market_ai
 from app.core.data_loader import load_market_file_minimal, iter_market_file_minimal_chunks, iterate_dataset_chunks
 from app.core.feature_engine import generate_features
-from app.core.strategy_engine import evolve_templates, walk_forward_validate, TEMPLATES
+from app.core.strategy_engine import evaluate_template, evolve_templates, walk_forward_validate, TEMPLATES
 from app.core.chart_adapter import build_candle_payload
 
 try:
@@ -115,6 +115,12 @@ class ResearchWorker(QObject):
     survivedCountChanged = Signal(int)
     rejectedCountChanged = Signal(int)
     bestScoreChanged = Signal(float)
+    currentChunkChanged = Signal(int)
+    totalChunksChanged = Signal(int)
+    rowsProcessedChanged = Signal(int)
+    currentCandidateChanged = Signal(int)
+    totalCandidatesChanged = Signal(int)
+    activeTemplateChanged = Signal(str)
 
     def __init__(
         self,
@@ -207,6 +213,12 @@ class ResearchWorker(QObject):
     def run(self):
         try:
             self.aiStateChanged.emit("idle")
+            self.currentChunkChanged.emit(0)
+            self.totalChunksChanged.emit(0)
+            self.rowsProcessedChanged.emit(0)
+            self.currentCandidateChanged.emit(0)
+            self.totalCandidatesChanged.emit(0)
+            self.activeTemplateChanged.emit("n/a")
             if self.full_data_mode:
                 self.log.emit("INFO", "Research branch: full-data incremental mode")
                 if not self.dataset_path:
@@ -424,40 +436,145 @@ class ResearchWorker(QObject):
 
                 if self.full_data_mode and self.dataset_path:
                     self.log.emit("INFO", f"full-data evolution mode active: generation={gen} processing all dataset chunks")
-                    chunk_frames: list[pd.DataFrame] = []
                     chunk_rows_processed = 0
                     chunk_counter = 0
+                    agg_rows: dict[str, dict] = {}
+                    candidate_defs: list[dict] = []
                     for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
                         if self._cancel:
                             return
                         chunk_counter = chunk_idx
+                        self.currentChunkChanged.emit(int(chunk_idx))
+                        self.totalChunksChanged.emit(int(chunk_counter))
                         chunk_rows = int(len(chunk_df))
                         chunk_rows_processed += chunk_rows
+                        self.rowsProcessedChanged.emit(int(chunk_rows_processed))
                         chunk_featured_df, _ = generate_features(chunk_df, selected_features)
-                        chunk_all, _ = evolve_templates(
-                            chunk_featured_df,
-                            top_k=self.population_top_k,
-                            min_trades=50,
-                            result_cb=None,
-                            constraint_cb=lambda message: self.log.emit("WARN", str(message)),
-                            progress_cb=lambda idx, total, name: self._resources.cooperative_yield("Backtesting", idx, total, name),
-                            seed_pool=seed_pool,
-                            max_variants=180,
-                            exploration_strength=max(0.1, 1.0 - ((gen - 1) / max(1, self.generations - 1))),
-                            mutation_only_from_seed=(gen > 1),
-                            cooperative_cb=lambda stage, idx, total, detail: self._resources.cooperative_yield("Evolution", idx, total, detail),
-                        )
-                        if not chunk_all.empty:
-                            chunk_all = chunk_all.copy()
-                            chunk_all["chunk_index"] = int(chunk_idx)
-                            chunk_frames.append(chunk_all)
+                        if chunk_idx == 1:
+                            chunk_all, _ = evolve_templates(
+                                chunk_featured_df,
+                                top_k=self.population_top_k,
+                                min_trades=50,
+                                result_cb=None,
+                                constraint_cb=lambda message: self.log.emit("WARN", str(message)),
+                                progress_cb=lambda idx, total, name: self._resources.cooperative_yield("Backtesting", idx, total, name),
+                                seed_pool=seed_pool,
+                                max_variants=180,
+                                exploration_strength=max(0.1, 1.0 - ((gen - 1) / max(1, self.generations - 1))),
+                                mutation_only_from_seed=(gen > 1),
+                                cooperative_cb=lambda stage, idx, total, detail: self._resources.cooperative_yield("Evolution", idx, total, detail),
+                            )
+                            candidate_defs = chunk_all[["strategy", "template_key", "params", "origin", "mutation_type", "parent_id", "complexity_score"]].to_dict("records")
+                            self.totalCandidatesChanged.emit(int(len(candidate_defs)))
+                        if not candidate_defs:
+                            continue
+                        for cand_idx, cand in enumerate(candidate_defs, start=1):
+                            if self._cancel:
+                                return
+                            self.currentCandidateChanged.emit(int(cand_idx))
+                            tkey = str(cand.get("template_key", ""))
+                            params = dict(cand.get("params", {}))
+                            self.activeTemplateChanged.emit(str(tkey or "n/a"))
+                            evaluated = evaluate_template(chunk_featured_df, tkey, params=params)
+                            test = dict(evaluated["test"].metrics)
+                            test_trades = evaluated["test"].trades
+                            wins = int((test_trades["net_pnl"] > 0).sum()) if not test_trades.empty else 0
+                            losses = int((test_trades["net_pnl"] < 0).sum()) if not test_trades.empty else 0
+                            sig = f"{tkey}|{json.dumps(params, sort_keys=True)}"
+                            state = agg_rows.get(sig)
+                            if state is None:
+                                state = {
+                                    "strategy": str(cand.get("strategy", tkey)),
+                                    "template_key": tkey,
+                                    "params": params,
+                                    "origin": str(cand.get("origin", "mutation")),
+                                    "mutation_type": str(cand.get("mutation_type", "base")),
+                                    "parent_id": str(cand.get("parent_id", "none")),
+                                    "complexity_score": float(cand.get("complexity_score", 0.0)),
+                                    "robustness_sum": 0.0,
+                                    "return_sum": 0.0,
+                                    "drawdown_sum": 0.0,
+                                    "trade_sum": 0,
+                                    "wins_sum": 0,
+                                    "loss_sum": 0,
+                                    "chunks": 0,
+                                }
+                            state["robustness_sum"] += float(evaluated.get("robustness_score", 0.0))
+                            state["return_sum"] += float(test.get("total_return_pct", 0.0))
+                            state["drawdown_sum"] += float(test.get("max_drawdown_pct", 0.0))
+                            state["trade_sum"] += int(test.get("total_trades", 0))
+                            state["wins_sum"] += int(wins)
+                            state["loss_sum"] += int(losses)
+                            state["chunks"] += 1
+                            agg_rows[sig] = state
                         self.log.emit(
                             "INFO",
                             f"full-data evolution chunk={chunk_idx} chunk_rows={chunk_rows:,} rows_processed={chunk_rows_processed:,}",
                         )
-                    if not chunk_frames:
+                    if not agg_rows:
                         raise RuntimeError("No strategy variants generated in full-data chunk evolution")
-                    all_variants = pd.concat(chunk_frames, ignore_index=True)
+                    merged_rows = []
+                    for sig, state in agg_rows.items():
+                        total_trades = int(state["trade_sum"])
+                        if total_trades < 50:
+                            self.log.emit("WARN", f"Strategy rejected: insufficient trades ({total_trades} < 50) template={state['template_key']}")
+                            continue
+                        wins_sum = int(state["wins_sum"])
+                        loss_sum = int(state["loss_sum"])
+                        denom = max(1, wins_sum + loss_sum)
+                        win_rate = float((wins_sum / denom) * 100.0)
+                        chunks = max(1, int(state["chunks"]))
+                        row = {
+                            "strategy": state["strategy"],
+                            "template_key": state["template_key"],
+                            "params": state["params"],
+                            "origin": state["origin"],
+                            "mutation_type": state["mutation_type"],
+                            "parent_id": state["parent_id"],
+                            "complexity_score": float(state["complexity_score"]),
+                            "robustness_score": float(state["robustness_sum"]) / chunks,
+                            "test_return_pct": float(state["return_sum"]),
+                            "test_win_rate_pct": win_rate,
+                            "test_max_drawdown_pct": float(state["drawdown_sum"]) / chunks,
+                            "test_trades": total_trades,
+                            "test_avg_trade_return_pct": 0.0,
+                            "test_max_win_pct": 0.0,
+                            "test_max_loss_pct": 0.0,
+                            "test_win_trades": wins_sum,
+                            "test_loss_trades": loss_sum,
+                            "ctx_high_vol_avg_return": 0.0,
+                            "ctx_low_vol_avg_return": 0.0,
+                            "ctx_trending_avg_return": 0.0,
+                            "ctx_ranging_avg_return": 0.0,
+                            "ctx_trend_confidence": 0.0,
+                            "ctx_volatility_confidence": 0.0,
+                            "ctx_confidence": 0.0,
+                            "ctx_time_stability": 0.0,
+                            "ctx_decay_score": 0.0,
+                            "ctx_decay_flag": False,
+                            "ctx_sample_count": 0,
+                            "ctx_return_scale": 0.0,
+                            "performance_context": f"aggregated_full_data_chunks={chunks}",
+                            "behavior_robustness": 0.0,
+                        }
+                        merged_rows.append(row)
+                    if not merged_rows:
+                        raise RuntimeError("No strategy variants passed global full-data constraints")
+                    all_variants = pd.DataFrame(merged_rows)
+                    all_variants["structure_sig"] = all_variants.apply(lambda r: f"{r['template_key']}|{json.dumps(dict(r['params']), sort_keys=True)}", axis=1)
+                    dup_counts = all_variants["structure_sig"].value_counts()
+                    fam_counts = all_variants["template_key"].value_counts()
+                    all_variants["dup_penalty"] = all_variants["structure_sig"].map(lambda s: max(0.0, float(dup_counts.get(s, 1) - 1) * 1.6))
+                    all_variants["family_penalty"] = all_variants["template_key"].map(lambda k: max(0.0, float(fam_counts.get(k, 1) / max(1, len(all_variants)) * 10.0)))
+                    all_variants["fitness"] = (
+                        all_variants["robustness_score"] * 0.50 +
+                        all_variants["test_return_pct"] * 0.30 +
+                        all_variants["test_win_rate_pct"] * 0.10 -
+                        all_variants["test_max_drawdown_pct"].abs() * 0.10 +
+                        all_variants["complexity_score"] * 0.05 -
+                        all_variants["dup_penalty"] -
+                        all_variants["family_penalty"]
+                    )
                     all_variants = all_variants.sort_values("fitness", ascending=False).reset_index(drop=True)
                     top_variants = all_variants.head(max(1, int(self.population_top_k))).reset_index(drop=True)
                     for streamed_idx, (_, streamed_row) in enumerate(top_variants.iterrows(), start=1):
@@ -982,6 +1099,7 @@ class AppState(QObject):
     bestScoreChanged = Signal()
     rowCountsChanged = Signal()
     researchMetaChanged = Signal()
+    liveTelemetryChanged = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -1039,6 +1157,12 @@ class AppState(QObject):
         self._source_timeframe_label = "n/a"
         self._research_timeframe_label = "n/a"
         self._executed_trade_count = -1
+        self._current_chunk = 0
+        self._total_chunks = 0
+        self._current_candidate = 0
+        self._total_candidates = 0
+        self._rows_processed_live = 0
+        self._active_template_name = "n/a"
         self._rank_tick = 0
         self._rank_tracker: dict[str, dict] = {}
         self._elite_pool: dict[str, dict] = {}
@@ -1169,6 +1293,30 @@ class AppState(QObject):
     @Property(int, notify=researchMetaChanged)
     def executedTrades(self):
         return int(self._executed_trade_count)
+
+    @Property(int, notify=liveTelemetryChanged)
+    def currentChunk(self):
+        return int(self._current_chunk)
+
+    @Property(int, notify=liveTelemetryChanged)
+    def totalChunks(self):
+        return int(self._total_chunks)
+
+    @Property(int, notify=liveTelemetryChanged)
+    def currentCandidate(self):
+        return int(self._current_candidate)
+
+    @Property(int, notify=liveTelemetryChanged)
+    def totalCandidates(self):
+        return int(self._total_candidates)
+
+    @Property(int, notify=liveTelemetryChanged)
+    def rowsProcessedLive(self):
+        return int(self._rows_processed_live)
+
+    @Property(str, notify=liveTelemetryChanged)
+    def activeTemplateName(self):
+        return str(self._active_template_name or "n/a")
 
 
     @Property(str, notify=chartTimeframeChanged)
@@ -1465,6 +1613,12 @@ class AppState(QObject):
         self._ai_state = "idle"
         self._research_timeframe_label = self._source_timeframe_label or "n/a"
         self._executed_trade_count = -1
+        self._current_chunk = 0
+        self._total_chunks = 0
+        self._current_candidate = 0
+        self._total_candidates = 0
+        self._rows_processed_live = 0
+        self._active_template_name = "n/a"
         self.currentGenerationChanged.emit()
         self.totalGenerationsChanged.emit()
         self.candidateCountChanged.emit()
@@ -1474,6 +1628,7 @@ class AppState(QObject):
         self.bestScoreChanged.emit()
         self.aiStateChanged.emit()
         self.researchMetaChanged.emit()
+        self.liveTelemetryChanged.emit()
         self.rowCountsChanged.emit()
         self.strategiesChanged.emit()
         self.selectedStrategyChanged.emit()
@@ -1537,6 +1692,12 @@ class AppState(QObject):
         self._worker.survivedCountChanged.connect(self._on_survived_count_changed)
         self._worker.rejectedCountChanged.connect(self._on_rejected_count_changed)
         self._worker.bestScoreChanged.connect(self._on_best_score_changed)
+        self._worker.currentChunkChanged.connect(self._on_current_chunk_changed)
+        self._worker.totalChunksChanged.connect(self._on_total_chunks_changed)
+        self._worker.currentCandidateChanged.connect(self._on_current_candidate_changed)
+        self._worker.totalCandidatesChanged.connect(self._on_total_candidates_changed)
+        self._worker.rowsProcessedChanged.connect(self._on_rows_processed_changed)
+        self._worker.activeTemplateChanged.connect(self._on_active_template_changed)
         self._worker.strategy.connect(self._on_strategy)
         self._worker.ai_epoch.connect(self._on_ai_epoch)
         self._worker.aiStateChanged.connect(self._on_ai_state_changed)
@@ -2012,6 +2173,36 @@ class AppState(QObject):
     def _on_best_score_changed(self, value: float):
         self._best_score = float(value)
         self.bestScoreChanged.emit()
+
+    @Slot(int)
+    def _on_current_chunk_changed(self, value: int):
+        self._current_chunk = int(max(0, value))
+        self.liveTelemetryChanged.emit()
+
+    @Slot(int)
+    def _on_total_chunks_changed(self, value: int):
+        self._total_chunks = int(max(0, value))
+        self.liveTelemetryChanged.emit()
+
+    @Slot(int)
+    def _on_current_candidate_changed(self, value: int):
+        self._current_candidate = int(max(0, value))
+        self.liveTelemetryChanged.emit()
+
+    @Slot(int)
+    def _on_total_candidates_changed(self, value: int):
+        self._total_candidates = int(max(0, value))
+        self.liveTelemetryChanged.emit()
+
+    @Slot(int)
+    def _on_rows_processed_changed(self, value: int):
+        self._rows_processed_live = int(max(0, value))
+        self.liveTelemetryChanged.emit()
+
+    @Slot(str)
+    def _on_active_template_changed(self, value: str):
+        self._active_template_name = str(value or "n/a")
+        self.liveTelemetryChanged.emit()
 
     @Slot(object, object)
     def _on_dataset_loaded(self, df: object, profile: object):
