@@ -4,6 +4,7 @@ import json
 import hashlib
 import sys
 import time
+import logging
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from dataclasses import asdict
@@ -20,6 +21,10 @@ from app.core.feature_engine import generate_features
 from app.core.strategy_engine import evolve_templates, walk_forward_validate, TEMPLATES
 from app.core.chart_adapter import build_candle_payload
 
+try:
+    import psutil
+except Exception:  # optional dependency for cross-platform memory checks
+    psutil = None
 
 class ResourceController:
     def __init__(self, ram_limit_gb: float, cpu_throttle: int, log_cb=None, stage_cb=None):
@@ -29,21 +34,33 @@ class ResourceController:
         self.stage_cb = stage_cb
         self._last_log_ts = 0.0
         self._last_stage_ts = 0.0
+        self._psutil_warned = False
 
     def update(self, ram_limit_gb: float, cpu_throttle: int):
         self.ram_limit_gb = max(0.25, float(ram_limit_gb))
         self.cpu_throttle = max(0, min(95, int(cpu_throttle)))
 
     def memory_usage_gb(self) -> float:
+        if psutil is None:
+            if not self._psutil_warned:
+                msg = "psutil is not installed; RAM limiter is using fallback usage=0.0GB"
+                if self.log_cb is not None:
+                    self.log_cb("WARN", msg)
+                else:
+                    logging.getLogger(__name__).warning(msg)
+                self._psutil_warned = True
+            return 0.0
+
         try:
-            with open("/proc/self/status", "r", encoding="utf-8") as fh:
-                for line in fh:
-                    if line.startswith("VmRSS:"):
-                        kb = float(line.split()[1])
-                        return kb / (1024.0 * 1024.0)
-        except Exception:
-            pass
-        return 0.0
+            rss_bytes = float(psutil.Process().memory_info().rss)
+            return rss_bytes / (1024.0 ** 3)
+        except Exception as exc:
+            msg = f"Unable to read RAM usage via psutil; using fallback usage=0.0GB ({exc})"
+            if self.log_cb is not None:
+                self.log_cb("WARN", msg)
+            else:
+                logging.getLogger(__name__).warning(msg)
+            return 0.0
 
     def cooperative_yield(self, stage: str, current: int, total: int, detail: str = ""):
         throttle = max(0.0, self.cpu_throttle / 100.0)
@@ -56,17 +73,20 @@ class ResourceController:
         high_watermark = self.ram_limit_gb * 0.90
         over_limit = mem_gb >= self.ram_limit_gb
         near_limit = mem_gb >= high_watermark
+        limiter_state = "LIMIT EXCEEDED" if over_limit else ("NEAR LIMIT" if near_limit else "NORMAL")
+
         if near_limit:
             extra_delay = 0.020 if over_limit else 0.010
             time.sleep(extra_delay)
-            now = time.time()
-            if self.log_cb is not None and now - self._last_log_ts > 1.0:
-                status = "exceeded" if over_limit else "near"
-                self.log_cb(
-                    "WARN",
-                    f"RAM limiter active ({status} limit): usage={mem_gb:.2f}GB limit={self.ram_limit_gb:.2f}GB stage={stage}",
-                )
-                self._last_log_ts = now
+
+        now = time.time()
+        if self.log_cb is not None and now - self._last_log_ts > 1.0:
+            level = "WARN" if near_limit else "INFO"
+            self.log_cb(
+                level,
+                f"RAM usage={mem_gb:.2f}GB limit={self.ram_limit_gb:.2f}GB state={limiter_state} stage={stage}",
+            )
+            self._last_log_ts = now
 
         now = time.time()
         if self.stage_cb is not None and (current <= 1 or current >= total or now - self._last_stage_ts > 0.35):
@@ -1371,6 +1391,8 @@ def run_qml() -> int:
     engine = QQmlApplicationEngine()
 
     state = AppState()
+    state.setParent(app)
+    engine._app_state = state  # keep a strong reference for the full engine lifetime
     engine.rootContext().setContextProperty("appState", state)
     qml_path = Path(__file__).resolve().parents[1] / "qml" / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_path)))
