@@ -105,6 +105,8 @@ class ResearchWorker(QObject):
     ai_epoch = Signal(object)
     finished = Signal(object)
     failed = Signal(str)
+    currentGenerationChanged = Signal(int)
+    totalGenerationsChanged = Signal(int)
 
     def __init__(
         self,
@@ -252,12 +254,14 @@ class ResearchWorker(QObject):
 
             self.stage.emit("Strategy generation")
             self.log.emit("INFO", "strategy generation started")
+            self.totalGenerationsChanged.emit(int(self.generations))
             generation_fitness: list[float] = []
             seed_pool: list[dict] = []
             last_top = None
             strategy_counter = 0
 
             for gen in range(1, self.generations + 1):
+                self.currentGenerationChanged.emit(int(gen))
                 if self._cancel:
                     return
                 self.stage.emit(f"Backtest generation {gen}/{self.generations}")
@@ -710,6 +714,8 @@ class AppState(QObject):
     featureMetaChanged = Signal()
     maxRamGbChanged = Signal()
     cpuThrottleChanged = Signal()
+    currentGenerationChanged = Signal()
+    totalGenerationsChanged = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -754,6 +760,8 @@ class AppState(QObject):
         self._loaded_rows = 0
         self._feature_rows = 0
         self._research_rows = 0
+        self._current_generation = 0
+        self._total_generations = 0
         self._rank_tick = 0
         self._rank_tracker: dict[str, dict] = {}
         self._elite_pool: dict[str, dict] = {}
@@ -824,6 +832,14 @@ class AppState(QObject):
     @Property(str, notify=stageTextChanged)
     def stageText(self):
         return self._stage_text
+
+    @Property(int, notify=currentGenerationChanged)
+    def currentGeneration(self):
+        return int(self._current_generation)
+
+    @Property(int, notify=totalGenerationsChanged)
+    def totalGenerations(self):
+        return int(self._total_generations)
 
 
     @Property(str, notify=chartTimeframeChanged)
@@ -1061,6 +1077,10 @@ class AppState(QObject):
         self._elite_pool = {}
         self._strategy_perf_index = {}
         self._mutation_feedback = {}
+        self._current_generation = 0
+        self._total_generations = 0
+        self.currentGenerationChanged.emit()
+        self.totalGenerationsChanged.emit()
         self.strategiesChanged.emit()
         self.selectedStrategyChanged.emit()
         self.fitnessSeriesChanged.emit()
@@ -1105,6 +1125,8 @@ class AppState(QObject):
         self._thread.started.connect(self._worker.run)
         self._worker.log.connect(self._append_log)
         self._worker.stage.connect(self._set_stage)
+        self._worker.currentGenerationChanged.connect(self._on_current_generation_changed)
+        self._worker.totalGenerationsChanged.connect(self._on_total_generations_changed)
         self._worker.strategy.connect(self._on_strategy)
         self._worker.ai_epoch.connect(self._on_ai_epoch)
         self._worker.finished.connect(self._on_finished)
@@ -1520,6 +1542,16 @@ class AppState(QObject):
             self._thread.deleteLater()
         self._worker = None
         self._thread = None
+
+    @Slot(int)
+    def _on_current_generation_changed(self, value: int):
+        self._current_generation = int(max(0, value))
+        self.currentGenerationChanged.emit()
+
+    @Slot(int)
+    def _on_total_generations_changed(self, value: int):
+        self._total_generations = int(max(0, value))
+        self.totalGenerationsChanged.emit()
 
     @Slot(object, object)
     def _on_dataset_loaded(self, df: object, profile: object):
