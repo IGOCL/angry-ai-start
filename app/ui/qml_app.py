@@ -600,6 +600,8 @@ class DatasetLoadWorker(QObject):
 
 
 class AppState(QObject):
+    FEATURE_WORKING_SET_MAX_ROWS = 250_000
+
     strategiesChanged = Signal()
     logsChanged = Signal()
     selectedStrategyChanged = Signal()
@@ -847,12 +849,21 @@ class AppState(QObject):
         try:
             if self._base_df is None:
                 raise ValueError("Load a dataset before generating features")
+            total_rows = int(len(self._base_df))
+            working_limit = int(self.FEATURE_WORKING_SET_MAX_ROWS)
+            use_slice = total_rows > working_limit
+            working_df = self._base_df.tail(working_limit).copy() if use_slice else self._base_df
             groups = [
                 "EMA", "SMA", "RSI", "MACD", "ATR", "BOLLINGER",
                 "VOLATILITY", "VOLUME_SPIKE", "BREAKOUT", "CANDLE_RATIOS",
                 "VWAP", "MOMENTUM", "ORDER_FLOW", "ZSCORE",
             ]
             self._append_log("INFO", "Generating features from loaded dataset")
+            self._append_log(
+                "INFO",
+                f"Feature working set: total_rows={total_rows:,} working_rows={len(working_df):,} "
+                f"limit={working_limit:,} sliced={'yes' if use_slice else 'no'}",
+            )
             resources = ResourceController(self._max_ram_gb, self._cpu_throttle, log_cb=self._append_log, stage_cb=self._set_stage)
 
             def _feature_progress(idx: int, total: int, feature_name: str):
@@ -860,7 +871,7 @@ class AppState(QObject):
                 QGuiApplication.processEvents()
 
             feature_df, generated_cols = generate_features(
-                self._base_df,
+                working_df,
                 groups,
                 progress_cb=_feature_progress,
                 cooperative_cb=_feature_progress,
