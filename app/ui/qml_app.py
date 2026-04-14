@@ -315,7 +315,12 @@ class ResearchWorker(QObject):
                 return
 
             working_df = featured_df
-            if len(working_df) > 10000:
+            if self.full_data_mode:
+                self.log.emit(
+                    "INFO",
+                    f"Full-data research mode active: research rows actually used={len(working_df):,} (no 10,000-row downsample applied)",
+                )
+            elif len(working_df) > 10000:
                 stride = max(1, len(working_df) // 10000)
                 working_df = working_df.iloc[::stride].reset_index(drop=True)
                 self.log.emit("WARN", f"Downsampled research rows for responsiveness: {len(featured_df):,}->{len(working_df):,}")
@@ -417,19 +422,65 @@ class ResearchWorker(QObject):
                         f"win={payload['win_rate']:.2f}% pnl={payload['pnl']:.2f}% dd={payload['drawdown']:.2f}%"
                     )
 
-                all_variants, top_variants = evolve_templates(
-                    working_df,
-                    top_k=self.population_top_k,
-                    min_trades=50,
-                    result_cb=_emit_streamed_variant,
-                    constraint_cb=lambda message: self.log.emit("WARN", str(message)),
-                    progress_cb=lambda idx, total, name: self._resources.cooperative_yield("Backtesting", idx, total, name),
-                    seed_pool=seed_pool,
-                    max_variants=180,
-                    exploration_strength=max(0.1, 1.0 - ((gen - 1) / max(1, self.generations - 1))),
-                    mutation_only_from_seed=(gen > 1),
-                    cooperative_cb=lambda stage, idx, total, detail: self._resources.cooperative_yield("Evolution", idx, total, detail),
-                )
+                if self.full_data_mode and self.dataset_path:
+                    self.log.emit("INFO", f"full-data evolution mode active: generation={gen} processing all dataset chunks")
+                    chunk_frames: list[pd.DataFrame] = []
+                    chunk_rows_processed = 0
+                    chunk_counter = 0
+                    for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
+                        if self._cancel:
+                            return
+                        chunk_counter = chunk_idx
+                        chunk_rows = int(len(chunk_df))
+                        chunk_rows_processed += chunk_rows
+                        chunk_featured_df, _ = generate_features(chunk_df, selected_features)
+                        chunk_all, _ = evolve_templates(
+                            chunk_featured_df,
+                            top_k=self.population_top_k,
+                            min_trades=50,
+                            result_cb=None,
+                            constraint_cb=lambda message: self.log.emit("WARN", str(message)),
+                            progress_cb=lambda idx, total, name: self._resources.cooperative_yield("Backtesting", idx, total, name),
+                            seed_pool=seed_pool,
+                            max_variants=180,
+                            exploration_strength=max(0.1, 1.0 - ((gen - 1) / max(1, self.generations - 1))),
+                            mutation_only_from_seed=(gen > 1),
+                            cooperative_cb=lambda stage, idx, total, detail: self._resources.cooperative_yield("Evolution", idx, total, detail),
+                        )
+                        if not chunk_all.empty:
+                            chunk_all = chunk_all.copy()
+                            chunk_all["chunk_index"] = int(chunk_idx)
+                            chunk_frames.append(chunk_all)
+                        self.log.emit(
+                            "INFO",
+                            f"full-data evolution chunk={chunk_idx} chunk_rows={chunk_rows:,} rows_processed={chunk_rows_processed:,}",
+                        )
+                    if not chunk_frames:
+                        raise RuntimeError("No strategy variants generated in full-data chunk evolution")
+                    all_variants = pd.concat(chunk_frames, ignore_index=True)
+                    all_variants = all_variants.sort_values("fitness", ascending=False).reset_index(drop=True)
+                    top_variants = all_variants.head(max(1, int(self.population_top_k))).reset_index(drop=True)
+                    for streamed_idx, (_, streamed_row) in enumerate(top_variants.iterrows(), start=1):
+                        _emit_streamed_variant(streamed_idx, len(top_variants), streamed_row.to_dict())
+                    self.log.emit(
+                        "INFO",
+                        f"full-data evolution summary: generation={gen} chunks={chunk_counter} rows_processed={chunk_rows_processed:,} "
+                        f"candidates={len(all_variants):,} top={len(top_variants):,} no_10000_downsample=yes",
+                    )
+                else:
+                    all_variants, top_variants = evolve_templates(
+                        working_df,
+                        top_k=self.population_top_k,
+                        min_trades=50,
+                        result_cb=_emit_streamed_variant,
+                        constraint_cb=lambda message: self.log.emit("WARN", str(message)),
+                        progress_cb=lambda idx, total, name: self._resources.cooperative_yield("Backtesting", idx, total, name),
+                        seed_pool=seed_pool,
+                        max_variants=180,
+                        exploration_strength=max(0.1, 1.0 - ((gen - 1) / max(1, self.generations - 1))),
+                        mutation_only_from_seed=(gen > 1),
+                        cooperative_cb=lambda stage, idx, total, detail: self._resources.cooperative_yield("Evolution", idx, total, detail),
+                    )
                 if top_variants.empty:
                     raise RuntimeError("No strategy variants generated")
 
