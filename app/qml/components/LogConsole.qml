@@ -21,6 +21,14 @@ Rectangle {
             Label { text: "Logs"; color: "#D8E7FF"; font.bold: true }
             Item { Layout.fillWidth: true }
             Button {
+                text: "Copy"
+                onClicked: {
+                    if (typeof appState !== "undefined" && appState.copyAllLogsToClipboard) {
+                        appState.copyAllLogsToClipboard()
+                    }
+                }
+            }
+            Button {
                 text: root.expanded ? "Collapse" : "Expand"
                 onClicked: root.expanded = !root.expanded
             }
