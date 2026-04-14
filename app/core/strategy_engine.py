@@ -567,6 +567,29 @@ def _performance_context_analysis(test_df: pd.DataFrame, trades_df: pd.DataFrame
     }
 
 
+def _infer_timeframe_label_from_timestamp(series: pd.Series) -> str:
+    if series is None or len(series) < 3:
+        return "n/a"
+    ts = pd.to_datetime(series, utc=True, errors="coerce").dropna()
+    if len(ts) < 3:
+        return "n/a"
+    deltas = ts.diff().dropna().dt.total_seconds()
+    if deltas.empty:
+        return "n/a"
+    median_sec = float(deltas.median())
+    if median_sec <= 1.5:
+        return "1s"
+    if median_sec <= 61.0:
+        return "1m"
+    if median_sec <= 301.0:
+        return "5m"
+    if median_sec <= 901.0:
+        return "15m"
+    if median_sec <= 3601.0:
+        return "1h"
+    return f"{int(round(median_sec))}s"
+
+
 def evaluate_template(
     df: pd.DataFrame,
     template_key: str,
@@ -596,6 +619,7 @@ def evaluate_template(
     total_entry_signals = int(long_signals + short_signals)
     executed_trades_full = int(full_result.metrics.get("total_trades", 0))
     filtered_signals = int(max(0, total_entry_signals - executed_trades_full))
+    timeframe_label = _infer_timeframe_label_from_timestamp(staged.get("timestamp"))
 
     template = _template_by_key(template_key)
     merged_params = dict(template.params)
@@ -618,6 +642,7 @@ def evaluate_template(
             "short_entry_signals": short_signals,
             "executed_trades_full": executed_trades_full,
             "filtered_signals_estimate": filtered_signals,
+            "timeframe_label": timeframe_label,
         },
     }
 

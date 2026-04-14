@@ -31,6 +31,9 @@ Item {
                     Label { text: "Mutation tiers: active"; color: "#A1C7EB" }
                     Label { text: "Stagnation guard: on"; color: "#A1C7EB" }
                     Label { text: "Gen " + appState.currentGeneration + " / " + appState.totalGenerations; color: "#8FD3FF"; font.bold: true }
+                    Label { text: "Startup Phase: " + (appState.startupPhaseText && appState.startupPhaseText.length > 0 ? appState.startupPhaseText : "n/a"); color: "#A1C7EB" }
+                    Label { text: "Proposal Chunks: " + (appState.proposalChunksProcessed > 0 ? appState.proposalChunksProcessed : "n/a"); color: "#A1C7EB" }
+                    Label { text: "Proposal Rows: " + (appState.proposalRowsAccumulated > 0 ? appState.proposalRowsAccumulated : "n/a"); color: "#A1C7EB" }
                     Label { text: "Chunk " + (appState.currentChunk > 0 ? appState.currentChunk : "n/a") + " / " + (appState.totalChunks > 0 ? appState.totalChunks : "n/a"); color: "#A1C7EB" }
                     Label { text: "Candidate " + (appState.currentCandidate > 0 ? appState.currentCandidate : "n/a") + " / " + (appState.totalCandidates > 0 ? appState.totalCandidates : "n/a"); color: "#A1C7EB" }
                     Label { text: "Rows Processed: " + (appState.rowsProcessedLive > 0 ? appState.rowsProcessedLive : "n/a"); color: "#A1C7EB" }
@@ -63,10 +66,14 @@ Item {
                 anchors.fill: parent
                 anchors.margins: 10
                 model: appState.logs
-                delegate: Label {
+                delegate: TextArea {
                     required property var modelData
                     text: modelData.msg
                     color: "#9EC0E3"
+                    readOnly: true
+                    selectByMouse: true
+                    wrapMode: Text.WrapAnywhere
+                    background: null
                 }
                 ScrollBar.vertical: ScrollBar {}
             }

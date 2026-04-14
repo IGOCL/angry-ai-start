@@ -124,6 +124,9 @@ class ResearchWorker(QObject):
     currentCandidateChanged = Signal(int)
     totalCandidatesChanged = Signal(int)
     activeTemplateChanged = Signal(str)
+    startupPhaseChanged = Signal(str)
+    proposalChunksProcessedChanged = Signal(int)
+    proposalRowsAccumulatedChanged = Signal(int)
 
     def __init__(
         self,
@@ -222,6 +225,9 @@ class ResearchWorker(QObject):
             self.currentCandidateChanged.emit(0)
             self.totalCandidatesChanged.emit(0)
             self.activeTemplateChanged.emit("n/a")
+            self.startupPhaseChanged.emit("idle")
+            self.proposalChunksProcessedChanged.emit(0)
+            self.proposalRowsAccumulatedChanged.emit(0)
             if self.full_data_mode:
                 self.log.emit("INFO", "Research branch: full-data incremental mode")
                 if not self.dataset_path:
@@ -448,18 +454,30 @@ class ResearchWorker(QObject):
                     proposal_frames: list[pd.DataFrame] = []
                     proposal_rows = 0
                     proposal_chunks_used = 0
+                    self.startupPhaseChanged.emit("proposal sample collection started")
+                    self.log.emit("INFO", "proposal sample collection started")
                     for proposal_idx, proposal_chunk in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
                         if self._cancel:
                             return
                         proposal_frames.append(proposal_chunk)
                         proposal_rows += int(len(proposal_chunk))
                         proposal_chunks_used = proposal_idx
+                        self.proposalChunksProcessedChanged.emit(int(proposal_chunks_used))
+                        self.proposalRowsAccumulatedChanged.emit(int(proposal_rows))
+                        self.startupPhaseChanged.emit(f"proposal chunk {proposal_idx}/{proposal_chunk_limit}")
+                        self.log.emit("INFO", f"proposal chunk {proposal_idx}/{proposal_chunk_limit} rows_accumulated={proposal_rows:,}")
                         if proposal_idx >= proposal_chunk_limit:
                             break
                     if not proposal_frames:
                         raise RuntimeError("No proposal chunks available for full-data evolution")
+                    self.startupPhaseChanged.emit("proposal feature generation started")
+                    self.log.emit("INFO", "proposal feature generation started")
                     proposal_df = pd.concat(proposal_frames, ignore_index=True)
                     proposal_featured_df, _ = generate_features(proposal_df, selected_features)
+                    self.startupPhaseChanged.emit("proposal feature generation completed")
+                    self.log.emit("INFO", "proposal feature generation completed")
+                    self.startupPhaseChanged.emit("proposal candidate generation started")
+                    self.log.emit("INFO", "proposal candidate generation started")
                     proposal_all, _ = evolve_templates(
                         proposal_featured_df,
                         top_k=self.population_top_k,
@@ -475,6 +493,8 @@ class ResearchWorker(QObject):
                     )
                     candidate_defs: list[dict] = proposal_all[["strategy", "template_key", "params", "origin", "mutation_type", "parent_id", "complexity_score"]].to_dict("records")
                     self.totalCandidatesChanged.emit(int(len(candidate_defs)))
+                    self.startupPhaseChanged.emit("proposal candidate generation completed")
+                    self.log.emit("INFO", "proposal candidate generation completed")
                     self.log.emit(
                         "INFO",
                         f"full-data proposal sample: chunks={proposal_chunks_used} rows={proposal_rows:,} "
@@ -483,6 +503,9 @@ class ResearchWorker(QObject):
                     self.log.emit("INFO", "full-data global evaluation continues across all dataset chunks")
                     if not candidate_defs:
                         raise RuntimeError("No proposal candidates generated for full-data evolution")
+                    self.startupPhaseChanged.emit("first candidate evaluation started")
+                    self.log.emit("INFO", "first candidate evaluation started")
+                    ema_reset_logged = False
                     for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
                         if self._cancel:
                             return
@@ -508,6 +531,7 @@ class ResearchWorker(QObject):
                             losses = int((test_trades["net_pnl"] < 0).sum()) if not test_trades.empty else 0
                             entry_signals = int(signal_diag.get("total_entry_signals", 0))
                             filtered_signals = int(signal_diag.get("filtered_signals_estimate", 0))
+                            timeframe_label = str(signal_diag.get("timeframe_label", "n/a"))
                             sig = f"{tkey}|{json.dumps(params, sort_keys=True)}"
                             state = agg_rows.get(sig)
                             if state is None:
@@ -548,6 +572,31 @@ class ResearchWorker(QObject):
                                 self.log.emit(
                                     "INFO",
                                     f"Chunk {chunk_idx}: cumulative_trades={state['trade_sum']:,} template={tkey}",
+                                )
+                            is_ema_20_50 = (
+                                tkey == "ema_cross_20_50"
+                                and int(params.get("ema_fast", 20)) == 20
+                                and int(params.get("ema_slow", 50)) == 50
+                            )
+                            if is_ema_20_50:
+                                tf_mode = "raw_1s_rows" if timeframe_label == "1s" else ("resampled_1m_bars" if timeframe_label == "1m" else "other_granularity")
+                                if not ema_reset_logged:
+                                    self.log.emit(
+                                        "INFO",
+                                        "EMA20/50 continuity: indicators recomputed per chunk=yes open_position_carry_across_chunks=no",
+                                    )
+                                    ema_reset_logged = True
+                                self.log.emit(
+                                    "INFO",
+                                    f"EMA20/50 timeframe usage: tf={timeframe_label} mode={tf_mode} source_rows={len(chunk_featured_df):,}",
+                                )
+                                self.log.emit(
+                                    "INFO",
+                                    f"EMA20/50 diag: tf={timeframe_label} rows={len(chunk_featured_df):,} "
+                                    f"long_cross={int(signal_diag.get('long_entry_signals', 0))} "
+                                    f"short_cross={int(signal_diag.get('short_entry_signals', 0))} "
+                                    f"total_signals={entry_signals} executed_trades={int(test.get('total_trades', 0))} "
+                                    f"blocked={filtered_signals} chunk_reset=yes position_reset=yes",
                                 )
                         self.log.emit(
                             "INFO",
@@ -1160,6 +1209,7 @@ class AppState(QObject):
     rowCountsChanged = Signal()
     researchMetaChanged = Signal()
     liveTelemetryChanged = Signal()
+    startupProgressChanged = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -1225,6 +1275,9 @@ class AppState(QObject):
         self._total_candidates = 0
         self._rows_processed_live = 0
         self._active_template_name = "n/a"
+        self._startup_phase_text = "idle"
+        self._proposal_chunks_processed = 0
+        self._proposal_rows_accumulated = 0
         self._rank_tick = 0
         self._rank_tracker: dict[str, dict] = {}
         self._elite_pool: dict[str, dict] = {}
@@ -1387,6 +1440,18 @@ class AppState(QObject):
     @Property(str, notify=liveTelemetryChanged)
     def activeTemplateName(self):
         return str(self._active_template_name or "n/a")
+
+    @Property(str, notify=startupProgressChanged)
+    def startupPhaseText(self):
+        return str(self._startup_phase_text or "idle")
+
+    @Property(int, notify=startupProgressChanged)
+    def proposalChunksProcessed(self):
+        return int(self._proposal_chunks_processed)
+
+    @Property(int, notify=startupProgressChanged)
+    def proposalRowsAccumulated(self):
+        return int(self._proposal_rows_accumulated)
 
 
     @Property(str, notify=chartTimeframeChanged)
@@ -1691,6 +1756,9 @@ class AppState(QObject):
         self._total_candidates = 0
         self._rows_processed_live = 0
         self._active_template_name = "n/a"
+        self._startup_phase_text = "idle"
+        self._proposal_chunks_processed = 0
+        self._proposal_rows_accumulated = 0
         self.currentGenerationChanged.emit()
         self.totalGenerationsChanged.emit()
         self.candidateCountChanged.emit()
@@ -1703,6 +1771,7 @@ class AppState(QObject):
         self.aiStateChanged.emit()
         self.researchMetaChanged.emit()
         self.liveTelemetryChanged.emit()
+        self.startupProgressChanged.emit()
         self.rowCountsChanged.emit()
         self.strategiesChanged.emit()
         self.selectedStrategyChanged.emit()
@@ -1775,6 +1844,9 @@ class AppState(QObject):
         self._worker.totalCandidatesChanged.connect(self._on_total_candidates_changed)
         self._worker.rowsProcessedChanged.connect(self._on_rows_processed_changed)
         self._worker.activeTemplateChanged.connect(self._on_active_template_changed)
+        self._worker.startupPhaseChanged.connect(self._on_startup_phase_changed)
+        self._worker.proposalChunksProcessedChanged.connect(self._on_proposal_chunks_processed_changed)
+        self._worker.proposalRowsAccumulatedChanged.connect(self._on_proposal_rows_accumulated_changed)
         self._worker.strategy.connect(self._on_strategy)
         self._worker.ai_epoch.connect(self._on_ai_epoch)
         self._worker.aiStateChanged.connect(self._on_ai_state_changed)
@@ -2193,6 +2265,8 @@ class AppState(QObject):
             f"Executed trades (cumulative full-data): {self._executed_trade_count if self._executed_trade_count >= 0 else 'n/a'}",
         )
         self._append_log("INFO", f"Working-set snapshot after research: {self._working_set_text()}")
+        self._startup_phase_text = "complete"
+        self.startupProgressChanged.emit()
 
         self._cleanup_worker()
 
@@ -2203,6 +2277,8 @@ class AppState(QObject):
         if self._ai_state != "idle":
             self._ai_state = "idle"
             self.aiStateChanged.emit()
+        self._startup_phase_text = "failed"
+        self.startupProgressChanged.emit()
         self._set_stage("Failed")
         self._append_log("ERROR", message)
         self._cleanup_worker()
@@ -2300,6 +2376,21 @@ class AppState(QObject):
     def _on_active_template_changed(self, value: str):
         self._active_template_name = str(value or "n/a")
         self.liveTelemetryChanged.emit()
+
+    @Slot(str)
+    def _on_startup_phase_changed(self, value: str):
+        self._startup_phase_text = str(value or "idle")
+        self.startupProgressChanged.emit()
+
+    @Slot(int)
+    def _on_proposal_chunks_processed_changed(self, value: int):
+        self._proposal_chunks_processed = int(max(0, value))
+        self.startupProgressChanged.emit()
+
+    @Slot(int)
+    def _on_proposal_rows_accumulated_changed(self, value: int):
+        self._proposal_rows_accumulated = int(max(0, value))
+        self.startupProgressChanged.emit()
 
     @Slot(object, object)
     def _on_dataset_loaded(self, df: object, profile: object):
