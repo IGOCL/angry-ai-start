@@ -560,6 +560,45 @@ class ResearchWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class DatasetLoadWorker(QObject):
+    log = Signal(str, str)
+    stage = Signal(str)
+    finished = Signal(object, object)
+    failed = Signal(str)
+
+    def __init__(self, dataset_path: str, max_ram_gb: float, cpu_throttle: int):
+        super().__init__()
+        self.dataset_path = dataset_path
+        self._resources = ResourceController(max_ram_gb, cpu_throttle, log_cb=self.log.emit, stage_cb=self.stage.emit)
+
+    @Slot()
+    def run(self):
+        try:
+            if not self.dataset_path:
+                raise ValueError("No dataset selected")
+            if not Path(self.dataset_path).exists():
+                raise ValueError(f"Dataset not found: {self.dataset_path}")
+
+            self.stage.emit("Dataset load")
+            self.log.emit("INFO", f"Loading dataset from: {self.dataset_path}")
+            started_at = time.perf_counter()
+
+            def _progress(rows_loaded: int, total_rows: int, detail: str):
+                self._resources.cooperative_yield("Dataset load", max(1, rows_loaded), max(1, total_rows or rows_loaded), detail)
+                if rows_loaded % 200000 == 0:
+                    elapsed = max(1e-9, time.perf_counter() - started_at)
+                    self.log.emit("INFO", f"dataset load progress: rows={rows_loaded:,} speed={int(rows_loaded/elapsed):,}/s")
+
+            df, profile = load_market_file_minimal(
+                self.dataset_path,
+                progress_cb=_progress,
+                chunk_size=150_000,
+            )
+            self.finished.emit(df, asdict(profile))
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 class AppState(QObject):
     strategiesChanged = Signal()
     logsChanged = Signal()
@@ -618,6 +657,9 @@ class AppState(QObject):
 
         self._thread: QThread | None = None
         self._worker: ResearchWorker | None = None
+        self._load_thread: QThread | None = None
+        self._load_worker: DatasetLoadWorker | None = None
+        self._pending_research_start = False
         self._rank_tick = 0
         self._rank_tracker: dict[str, dict] = {}
         self._elite_pool: dict[str, dict] = {}
@@ -777,45 +819,26 @@ class AppState(QObject):
 
     @Slot()
     def loadDataset(self):
-        try:
-            if not self._dataset_path:
-                raise ValueError("No dataset selected")
-            self._append_log("INFO", f"Loading dataset from: {self._dataset_path}")
-            resources = ResourceController(self._max_ram_gb, self._cpu_throttle, log_cb=self._append_log, stage_cb=self._set_stage)
-            started_at = time.perf_counter()
+        if self._load_thread is not None:
+            self._append_log("WARN", "Dataset load already running")
+            return
+        if not self._dataset_path:
+            self._append_log("ERROR", "Dataset load failed: ValueError: No dataset selected")
+            return
 
-            def _progress(rows_loaded: int, total_rows: int, detail: str):
-                resources.cooperative_yield("Dataset load", max(1, rows_loaded), max(1, total_rows or rows_loaded), detail)
-                QGuiApplication.processEvents()
-                if rows_loaded % 200000 == 0:
-                    elapsed = max(1e-9, time.perf_counter() - started_at)
-                    self._append_log("INFO", f"dataset load progress: rows={rows_loaded:,} speed={int(rows_loaded/elapsed):,}/s")
-
-            df, profile = load_market_file_minimal(
-                self._dataset_path,
-                progress_cb=_progress,
-                chunk_size=150_000,
-            )
-            self._base_df = df
-            self._profile = asdict(profile)
-            self._preview_columns = list(df.columns)
-            self._preview_rows = df.head(20).astype(str).to_dict("records")
-            self.previewColumnsChanged.emit()
-            self.previewRowsChanged.emit()
-            self.profileChanged.emit()
-            self._feature_df = None
-            self._feature_columns = []
-            self._feature_preview_rows = []
-            self._feature_row_count = 0
-            self._generated_feature_count = 0
-            self.featureMetaChanged.emit()
-            self._refresh_chart_data()
-            self._set_stage("Dataset loaded")
-            self._append_log("INFO", f"Dataset loaded successfully: rows={profile.rows:,} cols={len(profile.columns)}")
-            self._append_log("INFO", f"Columns: {', '.join(profile.columns)}")
-            self._append_log("INFO", f"Range: {profile.start} -> {profile.end} | synthetic={profile.synthetic_pct:.2f}%")
-        except Exception as exc:
-            self._append_log("ERROR", f"Dataset load failed: {type(exc).__name__}: {exc}")
+        self._load_thread = QThread()
+        self._load_worker = DatasetLoadWorker(
+            self._dataset_path,
+            max_ram_gb=self._max_ram_gb,
+            cpu_throttle=self._cpu_throttle,
+        )
+        self._load_worker.moveToThread(self._load_thread)
+        self._load_thread.started.connect(self._load_worker.run)
+        self._load_worker.log.connect(self._append_log)
+        self._load_worker.stage.connect(self._set_stage)
+        self._load_worker.finished.connect(self._on_dataset_loaded)
+        self._load_worker.failed.connect(self._on_dataset_failed)
+        self._load_thread.start()
 
 
 
@@ -931,6 +954,7 @@ class AppState(QObject):
         if self._thread is not None:
             self._append_log("WARN", "Research already running")
             return
+        self._pending_research_start = False
         self._append_log("UI", "Start clicked")
         self._strategies = []
         self._selected_strategy = {}
@@ -957,6 +981,8 @@ class AppState(QObject):
         if self._base_df is None:
             self.loadDataset()
             if self._base_df is None:
+                self._pending_research_start = True
+                self._append_log("INFO", "Dataset loading started in background; research will start after load completes")
                 return
 
         self._model_status = "running"
@@ -1384,6 +1410,53 @@ class AppState(QObject):
             self._thread.deleteLater()
         self._worker = None
         self._thread = None
+
+    @Slot(object, object)
+    def _on_dataset_loaded(self, df: object, profile: object):
+        data = df
+        profile_dict = dict(profile)
+        self._base_df = data
+        self._profile = profile_dict
+        self._preview_columns = list(data.columns)
+        self._preview_rows = data.head(20).astype(str).to_dict("records")
+        self.previewColumnsChanged.emit()
+        self.previewRowsChanged.emit()
+        self.profileChanged.emit()
+        self._feature_df = None
+        self._feature_columns = []
+        self._feature_preview_rows = []
+        self._feature_row_count = 0
+        self._generated_feature_count = 0
+        self.featureMetaChanged.emit()
+        self._refresh_chart_data()
+        self._set_stage("Dataset loaded")
+        self._append_log("INFO", f"Dataset loaded successfully: rows={int(profile_dict.get('rows', 0)):,} cols={len(profile_dict.get('columns', []))}")
+        self._append_log("INFO", f"Columns: {', '.join(profile_dict.get('columns', []))}")
+        self._append_log(
+            "INFO",
+            f"Range: {profile_dict.get('start')} -> {profile_dict.get('end')} | synthetic={float(profile_dict.get('synthetic_pct', 0.0)):.2f}%",
+        )
+        self._cleanup_load_worker()
+        if self._pending_research_start and self._thread is None:
+            self._pending_research_start = False
+            self.startResearch()
+
+    @Slot(str)
+    def _on_dataset_failed(self, message: str):
+        self._append_log("ERROR", f"Dataset load failed: {message}")
+        self._pending_research_start = False
+        self._cleanup_load_worker()
+
+    def _cleanup_load_worker(self):
+        if self._load_thread is not None:
+            self._load_thread.quit()
+            self._load_thread.wait(2000)
+        if self._load_worker is not None:
+            self._load_worker.deleteLater()
+        if self._load_thread is not None:
+            self._load_thread.deleteLater()
+        self._load_worker = None
+        self._load_thread = None
 
 
 def run_qml() -> int:
