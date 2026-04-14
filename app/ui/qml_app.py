@@ -1391,6 +1391,8 @@ def run_qml() -> int:
     engine = QQmlApplicationEngine()
 
     state = AppState()
+    state.setParent(app)
+    engine._app_state = state  # keep a strong reference for the full engine lifetime
     engine.rootContext().setContextProperty("appState", state)
     qml_path = Path(__file__).resolve().parents[1] / "qml" / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_path)))
