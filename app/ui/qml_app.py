@@ -20,7 +20,8 @@ from PySide6.QtQml import QQmlApplicationEngine
 from app.core.ai_engine import analyze_market_ai
 from app.core.data_loader import load_market_file_minimal, iter_market_file_minimal_chunks, iterate_dataset_chunks
 from app.core.feature_engine import generate_features
-from app.core.strategy_engine import evaluate_template, evolve_templates, walk_forward_validate, TEMPLATES
+from app.core.strategy_engine import build_strategy_dataframe, evaluate_template, evolve_templates, walk_forward_validate, TEMPLATES
+from app.core.backtest_engine import BacktestConfig, run_backtest
 from app.core.chart_adapter import build_candle_payload
 
 try:
@@ -506,6 +507,10 @@ class ResearchWorker(QObject):
                     self.startupPhaseChanged.emit("first candidate evaluation started")
                     self.log.emit("INFO", "first candidate evaluation started")
                     ema_reset_logged = False
+                    warmup_row_limit = 2000
+                    warmup_raw = pd.DataFrame()
+                    candidate_trade_seen: dict[str, set[str]] = {}
+                    self.log.emit("INFO", f"continuity mode active: warmup_row_limit={warmup_row_limit} position_state_carry=yes")
                     for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
                         if self._cancel:
                             return
@@ -516,23 +521,50 @@ class ResearchWorker(QObject):
                         chunk_rows_processed += chunk_rows
                         self.rowsProcessedChanged.emit(int(chunk_rows_processed))
                         chunk_featured_df, _ = generate_features(chunk_df, selected_features)
+                        chunk_start_ts = pd.to_datetime(chunk_df.get("timestamp"), utc=True, errors="coerce").min() if "timestamp" in chunk_df.columns else None
+                        warmup_rows_used = int(len(warmup_raw))
+                        if warmup_rows_used > 0:
+                            self.log.emit("INFO", f"chunk boundary warmup carry: chunk={chunk_idx} warmup_rows={warmup_rows_used:,} position_state_carried=yes")
+                        else:
+                            self.log.emit("INFO", f"chunk boundary warmup carry: chunk={chunk_idx} warmup_rows=0 position_state_carried=no")
                         for cand_idx, cand in enumerate(candidate_defs, start=1):
                             if self._cancel:
                                 return
                             self.currentCandidateChanged.emit(int(cand_idx))
                             tkey = str(cand.get("template_key", ""))
                             params = dict(cand.get("params", {}))
+                            sig = f"{tkey}|{json.dumps(params, sort_keys=True)}"
                             self.activeTemplateChanged.emit(str(tkey or "n/a"))
                             evaluated = evaluate_template(chunk_featured_df, tkey, params=params)
                             test = dict(evaluated["test"].metrics)
                             signal_diag = dict(evaluated.get("signal_diagnostics", {}))
-                            test_trades = evaluated["test"].trades
-                            wins = int((test_trades["net_pnl"] > 0).sum()) if not test_trades.empty else 0
-                            losses = int((test_trades["net_pnl"] < 0).sum()) if not test_trades.empty else 0
-                            entry_signals = int(signal_diag.get("total_entry_signals", 0))
-                            filtered_signals = int(signal_diag.get("filtered_signals_estimate", 0))
+                            continuity_input = pd.concat([warmup_raw, chunk_df], ignore_index=True) if warmup_rows_used > 0 else chunk_df
+                            continuity_staged = build_strategy_dataframe(continuity_input, tkey, params=params)
+                            continuity_result = run_backtest(continuity_staged, BacktestConfig())
+                            continuity_trades = continuity_result.trades.copy()
+                            if "entry_time" in continuity_trades.columns and "exit_time" in continuity_trades.columns:
+                                continuity_trades["entry_time"] = pd.to_datetime(continuity_trades["entry_time"], utc=True, errors="coerce")
+                                continuity_trades["exit_time"] = pd.to_datetime(continuity_trades["exit_time"], utc=True, errors="coerce")
+                            trade_key_series = (
+                                continuity_trades.get("entry_time", pd.Series(dtype=object)).astype(str) + "|" +
+                                continuity_trades.get("exit_time", pd.Series(dtype=object)).astype(str) + "|" +
+                                continuity_trades.get("side", pd.Series(dtype=object)).astype(str)
+                            ) if not continuity_trades.empty else pd.Series(dtype=str)
+                            seen = candidate_trade_seen.setdefault(sig, set())
+                            if not continuity_trades.empty:
+                                continuity_trades["_trade_key"] = trade_key_series
+                            new_trades = continuity_trades.loc[~continuity_trades["_trade_key"].isin(seen)].copy() if not continuity_trades.empty else continuity_trades
+                            for key in new_trades.get("_trade_key", pd.Series(dtype=str)).tolist():
+                                seen.add(str(key))
+                            wins = int((new_trades["net_pnl"] > 0).sum()) if not new_trades.empty else 0
+                            losses = int((new_trades["net_pnl"] < 0).sum()) if not new_trades.empty else 0
+                            executed_trades = int(len(new_trades))
+                            signal_rows = continuity_staged
+                            if chunk_start_ts is not None and "timestamp" in continuity_staged.columns:
+                                signal_rows = continuity_staged.loc[pd.to_datetime(continuity_staged["timestamp"], utc=True, errors="coerce") >= chunk_start_ts]
+                            entry_signals = int(pd.to_numeric(signal_rows.get("long_entry", 0), errors="coerce").fillna(0).astype(bool).sum() + pd.to_numeric(signal_rows.get("short_entry", 0), errors="coerce").fillna(0).astype(bool).sum())
+                            filtered_signals = int(max(0, entry_signals - executed_trades))
                             timeframe_label = str(signal_diag.get("timeframe_label", "n/a"))
-                            sig = f"{tkey}|{json.dumps(params, sort_keys=True)}"
                             state = agg_rows.get(sig)
                             if state is None:
                                 state = {
@@ -554,9 +586,9 @@ class ResearchWorker(QObject):
                                     "chunks": 0,
                                 }
                             state["robustness_sum"] += float(evaluated.get("robustness_score", 0.0))
-                            state["return_sum"] += float(test.get("total_return_pct", 0.0))
+                            state["return_sum"] += float(pd.to_numeric(new_trades.get("return_pct", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()) if not new_trades.empty else 0.0
                             state["drawdown_sum"] += float(test.get("max_drawdown_pct", 0.0))
-                            state["trade_sum"] += int(test.get("total_trades", 0))
+                            state["trade_sum"] += int(executed_trades)
                             state["wins_sum"] += int(wins)
                             state["loss_sum"] += int(losses)
                             state["entry_signal_sum"] += int(entry_signals)
@@ -567,7 +599,7 @@ class ResearchWorker(QObject):
                                 self.log.emit(
                                     "INFO",
                                     f"Candidate diag [{tkey}] chunk={chunk_idx} signals={entry_signals} "
-                                    f"trades={int(test.get('total_trades', 0))} wins={wins} losses={losses} filtered={filtered_signals}",
+                                    f"trades={executed_trades} wins={wins} losses={losses} filtered={filtered_signals}",
                                 )
                                 self.log.emit(
                                     "INFO",
@@ -583,7 +615,7 @@ class ResearchWorker(QObject):
                                 if not ema_reset_logged:
                                     self.log.emit(
                                         "INFO",
-                                        "EMA20/50 continuity: indicators recomputed per chunk=yes open_position_carry_across_chunks=no",
+                                        "EMA20/50 continuity: indicators_initialized_with_warmup=yes open_position_carry_across_chunks=yes",
                                     )
                                     ema_reset_logged = True
                                 self.log.emit(
@@ -593,11 +625,12 @@ class ResearchWorker(QObject):
                                 self.log.emit(
                                     "INFO",
                                     f"EMA20/50 diag: tf={timeframe_label} rows={len(chunk_featured_df):,} "
-                                    f"long_cross={int(signal_diag.get('long_entry_signals', 0))} "
-                                    f"short_cross={int(signal_diag.get('short_entry_signals', 0))} "
-                                    f"total_signals={entry_signals} executed_trades={int(test.get('total_trades', 0))} "
-                                    f"blocked={filtered_signals} chunk_reset=yes position_reset=yes",
+                                    f"long_cross={int(pd.to_numeric(signal_rows.get('long_entry', 0), errors='coerce').fillna(0).astype(bool).sum())} "
+                                    f"short_cross={int(pd.to_numeric(signal_rows.get('short_entry', 0), errors='coerce').fillna(0).astype(bool).sum())} "
+                                    f"total_signals={entry_signals} executed_trades={executed_trades} "
+                                    f"blocked={filtered_signals} chunk_reset=no position_reset=no",
                                 )
+                        warmup_raw = pd.concat([warmup_raw, chunk_df], ignore_index=True).tail(warmup_row_limit).reset_index(drop=True)
                         self.log.emit(
                             "INFO",
                             f"full-data evolution chunk={chunk_idx} chunk_rows={chunk_rows:,} rows_processed={chunk_rows_processed:,}",
