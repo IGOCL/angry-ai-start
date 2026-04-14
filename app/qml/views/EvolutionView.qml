@@ -30,6 +30,7 @@ Item {
                     Label { text: "Exploration: adaptive"; color: "#A1C7EB" }
                     Label { text: "Mutation tiers: active"; color: "#A1C7EB" }
                     Label { text: "Stagnation guard: on"; color: "#A1C7EB" }
+                    Label { text: "Gen " + appState.currentGeneration + " / " + appState.totalGenerations; color: "#8FD3FF"; font.bold: true }
                 }
             }
         }
