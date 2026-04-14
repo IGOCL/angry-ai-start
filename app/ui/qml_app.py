@@ -1273,6 +1273,11 @@ class AppState(QObject):
 
         self._research_rows = int(len(self._base_df))
         self.rowCountsChanged.emit()
+        research_full_data_mode = True
+        if research_full_data_mode:
+            self._append_log("INFO", "Research mode: full-data incremental mode (chunk-processing enabled)")
+        else:
+            self._append_log("INFO", "Research mode: preview subset mode")
         self._append_log(
             "INFO",
             f"Research input working set: source_total_rows={self._source_total_rows if self._source_total_rows > 0 else 'n/a'} "
@@ -1293,8 +1298,9 @@ class AppState(QObject):
             model_type="mlp",
             max_ram_gb=self._max_ram_gb,
             cpu_throttle=self._cpu_throttle,
-            input_df=self._base_df,
-            input_profile=self._profile,
+            input_df=None if research_full_data_mode else self._base_df,
+            input_profile={} if research_full_data_mode else self._profile,
+            full_data_mode=research_full_data_mode,
         )
         self._worker.moveToThread(self._thread)
 
