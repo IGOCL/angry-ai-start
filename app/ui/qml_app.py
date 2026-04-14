@@ -285,6 +285,16 @@ class ResearchWorker(QObject):
             if self._cancel:
                 return
 
+            if self.full_data_mode and self.dataset_path:
+                self.log.emit("INFO", "Full-data processing started")
+                processed_rows = 0
+                for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
+                    if self._cancel:
+                        return
+                    processed_rows += int(len(chunk_df))
+                    self.log.emit("INFO", f"Processing chunk {chunk_idx}, rows processed {processed_rows:,}")
+                self.log.emit("INFO", "Full-data processing complete")
+
             self.stage.emit("Feature generation")
             self.log.emit("INFO", "feature generation started")
             selected_features = [
