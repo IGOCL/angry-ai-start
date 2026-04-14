@@ -104,6 +104,7 @@ class ResearchWorker(QObject):
     strategy = Signal(object)
     stage = Signal(str)
     ai_epoch = Signal(object)
+    aiStateChanged = Signal(str)
     finished = Signal(object)
     failed = Signal(str)
     currentGenerationChanged = Signal(int)
@@ -204,6 +205,7 @@ class ResearchWorker(QObject):
     @Slot()
     def run(self):
         try:
+            self.aiStateChanged.emit("idle")
             if self.full_data_mode:
                 self.log.emit("INFO", "Research branch: full-data incremental mode")
                 if not self.dataset_path:
@@ -530,6 +532,7 @@ class ResearchWorker(QObject):
                 raise RuntimeError("Evolution completed with no best strategy")
 
             self.stage.emit("Validation")
+            self.aiStateChanged.emit("evaluating")
             self.log.emit("INFO", "validation started")
             validation_targets = top_variants.head(min(5, len(top_variants)))
             wf = None
@@ -668,6 +671,7 @@ class ResearchWorker(QObject):
                 )
 
             self.stage.emit("AI analysis")
+            self.aiStateChanged.emit("training")
             self.log.emit("INFO", "AI analysis started")
 
             def _epoch_cb(epoch, total, loss, acc, extra):
@@ -691,6 +695,7 @@ class ResearchWorker(QObject):
                 )
 
             ai = analyze_market_ai(working_df, model_type=self.model_type, epoch_cb=_epoch_cb)
+            self.aiStateChanged.emit("complete")
             self.log.emit("INFO", "AI analysis completed")
 
             self.stage.emit("Finalizing results")
@@ -900,6 +905,7 @@ class AppState(QObject):
     valLossSeriesChanged = Signal()
     valAccuracySeriesChanged = Signal()
     modelStatusChanged = Signal()
+    aiStateChanged = Signal()
     datasetPathChanged = Signal()
     stageTextChanged = Signal()
     regimeCountsChanged = Signal()
@@ -935,6 +941,7 @@ class AppState(QObject):
         self._regime_counts: dict = {}
         self._feature_importance: dict = {}
         self._model_status = "idle"
+        self._ai_state = "idle"
         self._dataset_path = ""
         self._stage_text = "Idle"
         self._profile: dict = {}
@@ -1036,6 +1043,10 @@ class AppState(QObject):
     @Property(str, notify=modelStatusChanged)
     def modelStatus(self):
         return self._model_status
+
+    @Property(str, notify=aiStateChanged)
+    def aiState(self):
+        return str(self._ai_state)
 
     @Property(str, notify=datasetPathChanged)
     def datasetPath(self):
@@ -1354,6 +1365,7 @@ class AppState(QObject):
         self._survived_count = 0
         self._rejected_count = 0
         self._best_score = 0.0
+        self._ai_state = "idle"
         self.currentGenerationChanged.emit()
         self.totalGenerationsChanged.emit()
         self.candidateCountChanged.emit()
@@ -1361,6 +1373,7 @@ class AppState(QObject):
         self.survivedCountChanged.emit()
         self.rejectedCountChanged.emit()
         self.bestScoreChanged.emit()
+        self.aiStateChanged.emit()
         self.rowCountsChanged.emit()
         self.strategiesChanged.emit()
         self.selectedStrategyChanged.emit()
@@ -1422,6 +1435,7 @@ class AppState(QObject):
         self._worker.bestScoreChanged.connect(self._on_best_score_changed)
         self._worker.strategy.connect(self._on_strategy)
         self._worker.ai_epoch.connect(self._on_ai_epoch)
+        self._worker.aiStateChanged.connect(self._on_ai_state_changed)
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
 
@@ -1790,11 +1804,24 @@ class AppState(QObject):
         self.valLossSeriesChanged.emit()
         self.valAccuracySeriesChanged.emit()
 
+    @Slot(str)
+    def _on_ai_state_changed(self, state: str):
+        next_state = str(state or "idle").strip().lower()
+        if next_state not in {"idle", "training", "evaluating", "complete"}:
+            next_state = "idle"
+        if next_state == self._ai_state:
+            return
+        self._ai_state = next_state
+        self.aiStateChanged.emit()
+
     @Slot(object)
     def _on_finished(self, payload: object):
         data = dict(payload)
         self._model_status = "completed"
         self.modelStatusChanged.emit()
+        if self._ai_state != "complete":
+            self._ai_state = "complete"
+            self.aiStateChanged.emit()
         self._set_stage("Final results ready")
 
         self._profile = dict(data.get("profile", {}))
@@ -1821,6 +1848,9 @@ class AppState(QObject):
     def _on_failed(self, message: str):
         self._model_status = "error"
         self.modelStatusChanged.emit()
+        if self._ai_state != "idle":
+            self._ai_state = "idle"
+            self.aiStateChanged.emit()
         self._set_stage("Failed")
         self._append_log("ERROR", message)
         self._cleanup_worker()

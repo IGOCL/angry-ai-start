@@ -21,6 +21,13 @@ Item {
             ChartPanel { Layout.fillWidth: true; Layout.fillHeight: true; title: "Val Accuracy"; series: appState.valAccuracySeries; lineColor: "#57C9A8" }
         }
 
+        Label {
+            Layout.fillWidth: true
+            text: "AI State: " + appState.aiState
+            color: "#D7EAFF"
+            font.bold: true
+        }
+
         RowLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
