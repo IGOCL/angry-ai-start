@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Tuple, Optional, Callable
+from collections import deque
 import time
 
 import pandas as pd
@@ -104,16 +105,26 @@ def load_csv_minimal_chunked(
     progress_cb: Callable[[int, int, str], None] | None = None,
     cancel_cb: Callable[[], bool] | None = None,
     chunk_size: int = 200_000,
+    tail_rows: int | None = None,
 ) -> pd.DataFrame:
     raw_columns = _read_csv_header(path)
     selected = _resolve_minimal_column_selection(raw_columns)
-    chunks: list[pd.DataFrame] = []
+    chunks: deque[pd.DataFrame] = deque()
+    buffered_rows = 0
     loaded_rows = 0
     start_time = time.perf_counter()
     for chunk in pd.read_csv(path, usecols=selected, chunksize=max(10_000, int(chunk_size))):
         if cancel_cb is not None and cancel_cb():
             raise RuntimeError("Dataset load cancelled")
         chunks.append(chunk)
+        buffered_rows += len(chunk)
+        if tail_rows is not None and tail_rows > 0:
+            while chunks and buffered_rows - len(chunks[0]) >= tail_rows:
+                buffered_rows -= len(chunks.popleft())
+            if chunks and buffered_rows > tail_rows:
+                overflow = buffered_rows - tail_rows
+                chunks[0] = chunks[0].iloc[overflow:].reset_index(drop=True)
+                buffered_rows -= overflow
         loaded_rows += len(chunk)
         if progress_cb is not None:
             elapsed = max(1e-9, time.perf_counter() - start_time)
@@ -134,11 +145,13 @@ def load_parquet_minimal_chunked(
     path: str,
     progress_cb: Callable[[int, int, str], None] | None = None,
     cancel_cb: Callable[[], bool] | None = None,
+    tail_rows: int | None = None,
 ) -> pd.DataFrame:
     raw_columns = _read_parquet_schema_names(path)
     selected = _resolve_minimal_column_selection(raw_columns)
     parquet_file = pq.ParquetFile(path)
-    chunks: list[pd.DataFrame] = []
+    chunks: deque[pd.DataFrame] = deque()
+    buffered_rows = 0
     loaded_rows = 0
     total_rows = int(parquet_file.metadata.num_rows) if parquet_file.metadata is not None else 0
     for rg in range(parquet_file.num_row_groups):
@@ -147,6 +160,14 @@ def load_parquet_minimal_chunked(
         table = parquet_file.read_row_group(rg, columns=selected)
         part = table.to_pandas()
         chunks.append(part)
+        buffered_rows += len(part)
+        if tail_rows is not None and tail_rows > 0:
+            while chunks and buffered_rows - len(chunks[0]) >= tail_rows:
+                buffered_rows -= len(chunks.popleft())
+            if chunks and buffered_rows > tail_rows:
+                overflow = buffered_rows - tail_rows
+                chunks[0] = chunks[0].iloc[overflow:].reset_index(drop=True)
+                buffered_rows -= overflow
         loaded_rows += len(part)
         if progress_cb is not None:
             progress_cb(loaded_rows, total_rows, f"row_group={rg + 1}/{parquet_file.num_row_groups}")
@@ -407,24 +428,95 @@ def load_market_file_minimal(
     progress_cb: Callable[[int, int, str], None] | None = None,
     cancel_cb: Callable[[], bool] | None = None,
     chunk_size: int = 200_000,
+    tail_rows: int | None = None,
 ):
     path = str(path)
     suffix = Path(path).suffix.lower()
 
     if suffix == ".csv":
-        if progress_cb is None and cancel_cb is None:
+        if progress_cb is None and cancel_cb is None and not tail_rows:
             df = load_csv_minimal(path)
         else:
-            df = load_csv_minimal_chunked(path, progress_cb=progress_cb, cancel_cb=cancel_cb, chunk_size=chunk_size)
+            df = load_csv_minimal_chunked(
+                path,
+                progress_cb=progress_cb,
+                cancel_cb=cancel_cb,
+                chunk_size=chunk_size,
+                tail_rows=tail_rows,
+            )
     elif suffix in PARQUET_EXTENSIONS:
-        if progress_cb is None and cancel_cb is None:
+        if progress_cb is None and cancel_cb is None and not tail_rows:
             df = load_parquet_minimal(path)
         else:
-            df = load_parquet_minimal_chunked(path, progress_cb=progress_cb, cancel_cb=cancel_cb)
+            df = load_parquet_minimal_chunked(
+                path,
+                progress_cb=progress_cb,
+                cancel_cb=cancel_cb,
+                tail_rows=tail_rows,
+            )
     else:
         raise ValueError("Unsupported file type. Use CSV or Parquet.")
 
     return _normalize_loaded_dataframe(df, path)
+
+
+def iter_market_file_minimal_chunks(
+    path: str | Path,
+    chunk_size: int = 200_000,
+    cancel_cb: Callable[[], bool] | None = None,
+):
+    path = str(path)
+    suffix = Path(path).suffix.lower()
+
+    if suffix == ".csv":
+        raw_columns = _read_csv_header(path)
+        selected = _resolve_minimal_column_selection(raw_columns)
+        processed_rows = 0
+        for idx, chunk in enumerate(pd.read_csv(path, usecols=selected, chunksize=max(10_000, int(chunk_size))), start=1):
+            if cancel_cb is not None and cancel_cb():
+                raise RuntimeError("Full-data processing cancelled")
+            chunk = normalize_columns(chunk)
+            chunk = parse_timestamp_column(chunk)
+            chunk = convert_numeric_columns(chunk)
+            chunk, _ = normalize_ohlc_rows(chunk)
+            chunk = chunk.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+            processed_rows += len(chunk)
+            yield chunk, {
+                "chunk_index": idx,
+                "total_chunks": 0,
+                "chunk_rows": int(len(chunk)),
+                "processed_rows": int(processed_rows),
+                "total_rows_estimate": 0,
+            }
+        return
+
+    if suffix in PARQUET_EXTENSIONS:
+        raw_columns = _read_parquet_schema_names(path)
+        selected = _resolve_minimal_column_selection(raw_columns)
+        parquet_file = pq.ParquetFile(path)
+        processed_rows = 0
+        total_rows = int(parquet_file.metadata.num_rows) if parquet_file.metadata is not None else 0
+        for rg in range(parquet_file.num_row_groups):
+            if cancel_cb is not None and cancel_cb():
+                raise RuntimeError("Full-data processing cancelled")
+            table = parquet_file.read_row_group(rg, columns=selected)
+            chunk = table.to_pandas()
+            chunk = normalize_columns(chunk)
+            chunk = parse_timestamp_column(chunk)
+            chunk = convert_numeric_columns(chunk)
+            chunk, _ = normalize_ohlc_rows(chunk)
+            chunk = chunk.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+            processed_rows += len(chunk)
+            yield chunk, {
+                "chunk_index": rg + 1,
+                "total_chunks": int(parquet_file.num_row_groups),
+                "chunk_rows": int(len(chunk)),
+                "processed_rows": int(processed_rows),
+                "total_rows_estimate": int(total_rows),
+            }
+        return
+
+    raise ValueError("Unsupported file type. Use CSV or Parquet.")
 
 
 def profile_to_text(profile: DataProfile) -> str:
