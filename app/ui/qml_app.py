@@ -563,6 +563,8 @@ class AppState(QObject):
     featureMetaChanged = Signal()
     maxRamGbChanged = Signal()
     cpuThrottleChanged = Signal()
+    CHART_NAV_BUFFER_MULTIPLIER = 4
+    CHART_NAV_BUFFER_MIN_CANDLES = 120
 
     def __init__(self) -> None:
         super().__init__()
@@ -878,7 +880,17 @@ class AppState(QObject):
             self._chart_window_size = min(1200, int(self._chart_window_size * 1.25))
         if self._chart_all_candles:
             self._chart_window_end = max(self._chart_window_size, min(len(self._chart_all_candles), self._chart_window_end))
+        if self._base_df is not None and len(self._chart_all_candles) < self._chart_window_size:
+            self._refresh_chart_data()
+            return
         self._update_chart_window()
+
+    def _chart_prepared_candle_count(self) -> int:
+        nav_buffer = max(
+            self.CHART_NAV_BUFFER_MIN_CANDLES,
+            int(self._chart_window_size * self.CHART_NAV_BUFFER_MULTIPLIER),
+        )
+        return self._chart_window_size + nav_buffer
 
     def _update_chart_window(self):
         if not self._chart_all_candles:
@@ -902,7 +914,12 @@ class AppState(QObject):
             self.chartWindowChanged.emit()
             return
 
-        self._chart_all_candles = build_candle_payload(self._base_df, timeframe=self._chart_timeframe, window=None)
+        prepared_count = self._chart_prepared_candle_count()
+        self._chart_all_candles = build_candle_payload(
+            self._base_df,
+            timeframe=self._chart_timeframe,
+            window=prepared_count,
+        )
         self._chart_window_end = len(self._chart_all_candles)
         self._update_chart_window()
 
