@@ -802,6 +802,7 @@ class AppState(QObject):
     survivedCountChanged = Signal()
     rejectedCountChanged = Signal()
     bestScoreChanged = Signal()
+    rowCountsChanged = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -953,6 +954,22 @@ class AppState(QObject):
     @Property(float, notify=bestScoreChanged)
     def bestScore(self):
         return float(self._best_score)
+
+    @Property(int, notify=rowCountsChanged)
+    def sourceTotalRows(self):
+        return int(self._source_total_rows)
+
+    @Property(int, notify=rowCountsChanged)
+    def loadedRows(self):
+        return int(self._loaded_rows)
+
+    @Property(int, notify=rowCountsChanged)
+    def featureRows(self):
+        return int(self._feature_rows)
+
+    @Property(int, notify=rowCountsChanged)
+    def researchRows(self):
+        return int(self._research_rows)
 
 
     @Property(str, notify=chartTimeframeChanged)
@@ -1132,6 +1149,7 @@ class AppState(QObject):
         self._loaded_rows = 0
         self._feature_rows = 0
         self._research_rows = 0
+        self.rowCountsChanged.emit()
         self.previewRowsChanged.emit()
         self.previewColumnsChanged.emit()
         self.featureMetaChanged.emit()
@@ -1225,6 +1243,7 @@ class AppState(QObject):
         self.survivedCountChanged.emit()
         self.rejectedCountChanged.emit()
         self.bestScoreChanged.emit()
+        self.rowCountsChanged.emit()
         self.strategiesChanged.emit()
         self.selectedStrategyChanged.emit()
         self.fitnessSeriesChanged.emit()
@@ -1241,6 +1260,7 @@ class AppState(QObject):
                 return
 
         self._research_rows = int(len(self._base_df))
+        self.rowCountsChanged.emit()
         self._append_log(
             "INFO",
             f"Research input working set: source_total_rows={self._source_total_rows if self._source_total_rows > 0 else 'n/a'} "
@@ -1737,6 +1757,7 @@ class AppState(QObject):
         self._loaded_rows = int(len(data))
         self._feature_rows = 0
         self._research_rows = 0
+        self.rowCountsChanged.emit()
         self._preview_columns = list(data.columns)
         self._preview_rows = data.head(20).astype(str).to_dict("records")
         self.previewColumnsChanged.emit()
@@ -1789,6 +1810,7 @@ class AppState(QObject):
         self._feature_row_count = int(len(df))
         self._generated_feature_count = int(len(cols))
         self._feature_rows = int(len(df))
+        self.rowCountsChanged.emit()
         self.featureMetaChanged.emit()
         self._append_log(
             "INFO",
