@@ -62,20 +62,21 @@ Item {
             radius: 12
             color: "#0F1725"
             border.color: "#1B2A41"
-            ListView {
+            ScrollView {
                 anchors.fill: parent
                 anchors.margins: 10
-                model: appState.logs
-                delegate: TextArea {
-                    required property var modelData
-                    text: modelData.msg
+                TextArea {
+                    width: parent.width
+                    text: appState.logs.map(function(item) { return item.msg }).join("\n")
                     color: "#9EC0E3"
                     readOnly: true
                     selectByMouse: true
-                    wrapMode: Text.WrapAnywhere
+                    selectByKeyboard: true
+                    persistentSelection: true
+                    wrapMode: TextEdit.WrapAnywhere
+                    textFormat: TextEdit.PlainText
                     background: null
                 }
-                ScrollBar.vertical: ScrollBar {}
             }
         }
     }
