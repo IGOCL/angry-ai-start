@@ -615,6 +615,50 @@ class DatasetLoadWorker(QObject):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+class FeatureGenerationWorker(QObject):
+    log = Signal(str, str)
+    stage = Signal(str)
+    finished = Signal(object, object, int, int, bool)
+    failed = Signal(str)
+
+    def __init__(self, base_df: pd.DataFrame, max_ram_gb: float, cpu_throttle: int, working_limit: int):
+        super().__init__()
+        self.base_df = base_df
+        self.working_limit = int(max(1, working_limit))
+        self._resources = ResourceController(max_ram_gb, cpu_throttle, log_cb=self.log.emit, stage_cb=self.stage.emit)
+
+    @Slot()
+    def run(self):
+        try:
+            groups = [
+                "EMA", "SMA", "RSI", "MACD", "ATR", "BOLLINGER",
+                "VOLATILITY", "VOLUME_SPIKE", "BREAKOUT", "CANDLE_RATIOS",
+                "VWAP", "MOMENTUM", "ORDER_FLOW", "ZSCORE",
+            ]
+            total_rows = int(len(self.base_df))
+            use_slice = total_rows > self.working_limit
+            working_df = self.base_df.tail(self.working_limit).copy() if use_slice else self.base_df
+            self.log.emit("INFO", "Generating features from loaded dataset")
+            self.log.emit(
+                "INFO",
+                f"Feature working set: total_rows={total_rows:,} working_rows={len(working_df):,} "
+                f"limit={self.working_limit:,} sliced={'yes' if use_slice else 'no'}",
+            )
+
+            def _feature_progress(idx: int, total: int, feature_name: str):
+                self._resources.cooperative_yield("Feature generation", idx, total, feature_name)
+
+            feature_df, generated_cols = generate_features(
+                working_df,
+                groups,
+                progress_cb=_feature_progress,
+                cooperative_cb=_feature_progress,
+            )
+            self.finished.emit(feature_df, generated_cols, total_rows, int(len(working_df)), use_slice)
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 class AppState(QObject):
     DATASET_LOAD_MAX_ROWS = 500_000
     FEATURE_WORKING_SET_MAX_ROWS = 250_000
@@ -678,6 +722,8 @@ class AppState(QObject):
         self._worker: ResearchWorker | None = None
         self._load_thread: QThread | None = None
         self._load_worker: DatasetLoadWorker | None = None
+        self._feature_thread: QThread | None = None
+        self._feature_worker: FeatureGenerationWorker | None = None
         self._pending_research_start = False
         self._rank_tick = 0
         self._rank_tracker: dict[str, dict] = {}
@@ -864,46 +910,27 @@ class AppState(QObject):
 
     @Slot()
     def generateFeatures(self):
-        try:
-            if self._base_df is None:
-                raise ValueError("Load a dataset before generating features")
-            total_rows = int(len(self._base_df))
-            working_limit = int(self.FEATURE_WORKING_SET_MAX_ROWS)
-            use_slice = total_rows > working_limit
-            working_df = self._base_df.tail(working_limit).copy() if use_slice else self._base_df
-            groups = [
-                "EMA", "SMA", "RSI", "MACD", "ATR", "BOLLINGER",
-                "VOLATILITY", "VOLUME_SPIKE", "BREAKOUT", "CANDLE_RATIOS",
-                "VWAP", "MOMENTUM", "ORDER_FLOW", "ZSCORE",
-            ]
-            self._append_log("INFO", "Generating features from loaded dataset")
-            self._append_log(
-                "INFO",
-                f"Feature working set: total_rows={total_rows:,} working_rows={len(working_df):,} "
-                f"limit={working_limit:,} sliced={'yes' if use_slice else 'no'}",
-            )
-            resources = ResourceController(self._max_ram_gb, self._cpu_throttle, log_cb=self._append_log, stage_cb=self._set_stage)
+        if self._feature_thread is not None:
+            self._append_log("WARN", "Feature generation already running")
+            return
+        if self._base_df is None:
+            self._append_log("ERROR", "Feature generation failed: ValueError: Load a dataset before generating features")
+            return
 
-            def _feature_progress(idx: int, total: int, feature_name: str):
-                resources.cooperative_yield("Feature generation", idx, total, feature_name)
-                QGuiApplication.processEvents()
-
-            feature_df, generated_cols = generate_features(
-                working_df,
-                groups,
-                progress_cb=_feature_progress,
-                cooperative_cb=_feature_progress,
-            )
-            self._feature_df = feature_df
-            self._feature_columns = list(feature_df.columns)
-            self._feature_preview_rows = feature_df.head(20).astype(str).to_dict("records")
-            self._feature_row_count = int(len(feature_df))
-            self._generated_feature_count = int(len(generated_cols))
-            self.featureMetaChanged.emit()
-            self._append_log("INFO", f"Features generated: {len(generated_cols)} new columns, rows={len(feature_df):,}")
-            self._append_log("INFO", f"Feature columns: {', '.join(generated_cols[:30])}{' ...' if len(generated_cols) > 30 else ''}")
-        except Exception as exc:
-            self._append_log("ERROR", f"Feature generation failed: {type(exc).__name__}: {exc}")
+        self._feature_thread = QThread()
+        self._feature_worker = FeatureGenerationWorker(
+            self._base_df,
+            max_ram_gb=self._max_ram_gb,
+            cpu_throttle=self._cpu_throttle,
+            working_limit=self.FEATURE_WORKING_SET_MAX_ROWS,
+        )
+        self._feature_worker.moveToThread(self._feature_thread)
+        self._feature_thread.started.connect(self._feature_worker.run)
+        self._feature_worker.log.connect(self._append_log)
+        self._feature_worker.stage.connect(self._set_stage)
+        self._feature_worker.finished.connect(self._on_features_generated)
+        self._feature_worker.failed.connect(self._on_features_failed)
+        self._feature_thread.start()
 
     @Slot()
     def clearDataset(self):
@@ -1486,6 +1513,40 @@ class AppState(QObject):
             self._load_thread.deleteLater()
         self._load_worker = None
         self._load_thread = None
+
+    @Slot(object, object, int, int, bool)
+    def _on_features_generated(self, feature_df: object, generated_cols: object, total_rows: int, working_rows: int, use_slice: bool):
+        df = feature_df
+        cols = list(generated_cols)
+        self._feature_df = df
+        self._feature_columns = list(df.columns)
+        self._feature_preview_rows = df.head(20).astype(str).to_dict("records")
+        self._feature_row_count = int(len(df))
+        self._generated_feature_count = int(len(cols))
+        self.featureMetaChanged.emit()
+        self._append_log(
+            "INFO",
+            f"Feature generation completed: total_rows={int(total_rows):,} working_rows={int(working_rows):,} "
+            f"sliced={'yes' if use_slice else 'no'} generated={len(cols)}",
+        )
+        self._append_log("INFO", f"Feature columns: {', '.join(cols[:30])}{' ...' if len(cols) > 30 else ''}")
+        self._cleanup_feature_worker()
+
+    @Slot(str)
+    def _on_features_failed(self, message: str):
+        self._append_log("ERROR", f"Feature generation failed: {message}")
+        self._cleanup_feature_worker()
+
+    def _cleanup_feature_worker(self):
+        if self._feature_thread is not None:
+            self._feature_thread.quit()
+            self._feature_thread.wait(2000)
+        if self._feature_worker is not None:
+            self._feature_worker.deleteLater()
+        if self._feature_thread is not None:
+            self._feature_thread.deleteLater()
+        self._feature_worker = None
+        self._feature_thread = None
 
 
 def run_qml() -> int:
