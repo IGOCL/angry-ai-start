@@ -30,6 +30,12 @@ Item {
                     Label { text: "Exploration: adaptive"; color: "#A1C7EB" }
                     Label { text: "Mutation tiers: active"; color: "#A1C7EB" }
                     Label { text: "Stagnation guard: on"; color: "#A1C7EB" }
+                    Label { text: "Gen " + appState.currentGeneration + " / " + appState.totalGenerations; color: "#8FD3FF"; font.bold: true }
+                    Label { text: "Candidates: " + appState.candidateCount; color: "#A1C7EB" }
+                    Label { text: "Evaluated: " + appState.evaluatedCount; color: "#A1C7EB" }
+                    Label { text: "Survived: " + appState.survivedCount; color: "#A1C7EB" }
+                    Label { text: "Rejected: " + appState.rejectedCount; color: "#A1C7EB" }
+                    Label { text: "Best Score: " + Number(appState.bestScore).toFixed(2); color: "#8FD3FF"; font.bold: true }
                 }
             }
         }
