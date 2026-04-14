@@ -203,16 +203,38 @@ class ResearchWorker(QObject):
     @Slot()
     def run(self):
         try:
-            if self.input_df is not None:
-                df = self.input_df
-                profile = self.input_profile
-                self.log.emit("INFO", f"dataset ready (preloaded): rows={len(df):,}")
-            else:
+            if self.full_data_mode:
+                self.log.emit("INFO", "Research branch: full-data incremental mode")
                 if not self.dataset_path:
                     raise ValueError("No dataset selected. Enter a CSV/Parquet path in the top bar.")
                 if not Path(self.dataset_path).exists():
                     raise ValueError(f"Dataset not found: {self.dataset_path}")
-
+                self.stage.emit("Full-data processing")
+                self.log.emit("INFO", "Full-data processing started")
+                processed_rows = 0
+                chunk_count = 0
+                df = None
+                for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
+                    if self._cancel:
+                        return
+                    chunk_count = chunk_idx
+                    chunk_rows = int(len(chunk_df))
+                    processed_rows += chunk_rows
+                    self.log.emit("INFO", f"Processing chunk {chunk_idx}, chunk rows {chunk_rows:,}, rows processed {processed_rows:,}")
+                    if df is None:
+                        df = chunk_df
+                if df is None:
+                    raise RuntimeError("Full-data processing produced no chunks")
+                self.log.emit("INFO", "Full-data processing complete")
+                profile = {"synthetic_pct": float(pd.to_numeric(df.get("synthetic", 0), errors="coerce").fillna(0).mean() * 100.0) if "synthetic" in df.columns else 0.0}
+                self.log.emit("INFO", f"full-data incremental summary: chunks={chunk_count} rows_processed={processed_rows:,}")
+            elif self.input_df is not None:
+                self.log.emit("INFO", "Research branch: preview/preloaded mode")
+                df = self.input_df
+                profile = self.input_profile
+                self.log.emit("INFO", f"dataset ready (preloaded): rows={len(df):,}")
+            else:
+                self.log.emit("INFO", "Research branch: preview/preloaded mode")
                 self.stage.emit("Dataset load")
                 self.log.emit("INFO", "dataset load started")
                 load_started_at = time.perf_counter()
