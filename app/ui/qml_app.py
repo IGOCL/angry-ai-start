@@ -16,7 +16,7 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 
 from app.core.ai_engine import analyze_market_ai
-from app.core.data_loader import load_market_file_minimal, iter_market_file_minimal_chunks
+from app.core.data_loader import load_market_file_minimal, iter_market_file_minimal_chunks, iterate_dataset_chunks
 from app.core.feature_engine import generate_features
 from app.core.strategy_engine import evolve_templates, walk_forward_validate, TEMPLATES
 from app.core.chart_adapter import build_candle_payload
@@ -123,6 +123,7 @@ class ResearchWorker(QObject):
         cpu_throttle: int = 0,
         input_df: pd.DataFrame | None = None,
         input_profile: dict | None = None,
+        full_data_mode: bool = False,
     ):
         super().__init__()
         self.dataset_path = dataset_path
@@ -131,6 +132,7 @@ class ResearchWorker(QObject):
         self.model_type = model_type
         self.input_df = input_df
         self.input_profile = dict(input_profile or {})
+        self.full_data_mode = bool(full_data_mode)
         self._cancel = False
         self._resources = ResourceController(max_ram_gb, cpu_throttle, log_cb=self.log.emit, stage_cb=self.stage.emit)
 
@@ -232,6 +234,16 @@ class ResearchWorker(QObject):
             self.log.emit("INFO", f"dataset ready: rows={len(df):,} synthetic={synthetic_pct:.2f}%")
             if self._cancel:
                 return
+
+            if self.full_data_mode and self.dataset_path:
+                self.log.emit("INFO", "Full-data processing started")
+                processed_rows = 0
+                for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
+                    if self._cancel:
+                        return
+                    processed_rows += int(len(chunk_df))
+                    self.log.emit("INFO", f"Processing chunk {chunk_idx}, rows processed {processed_rows:,}")
+                self.log.emit("INFO", "Full-data processing complete")
 
             self.stage.emit("Feature generation")
             self.log.emit("INFO", "feature generation started")

@@ -519,6 +519,29 @@ def iter_market_file_minimal_chunks(
     raise ValueError("Unsupported file type. Use CSV or Parquet.")
 
 
+def iterate_dataset_chunks(path: str | Path, chunk_size: int = 200_000):
+    path = str(path)
+    suffix = Path(path).suffix.lower()
+
+    if suffix == ".csv":
+        raw_columns = _read_csv_header(path)
+        selected = _resolve_minimal_column_selection(raw_columns)
+        for chunk in pd.read_csv(path, usecols=selected, chunksize=max(10_000, int(chunk_size))):
+            yield chunk
+        return
+
+    if suffix in PARQUET_EXTENSIONS:
+        raw_columns = _read_parquet_schema_names(path)
+        selected = _resolve_minimal_column_selection(raw_columns)
+        parquet_file = pq.ParquetFile(path)
+        for rg in range(parquet_file.num_row_groups):
+            table = parquet_file.read_row_group(rg, columns=selected)
+            yield table.to_pandas()
+        return
+
+    raise ValueError("Unsupported file type. Use CSV or Parquet.")
+
+
 def profile_to_text(profile: DataProfile) -> str:
     lines = [
         f"Path: {profile.path}",
