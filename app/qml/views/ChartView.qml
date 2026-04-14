@@ -167,13 +167,13 @@ Item {
                 anchors.fill: parent
                 acceptedButtons: Qt.LeftButton
                 hoverEnabled: true
-                onPressed: {
+                onPressed: function(mouse) {
                     root.lastX = mouse.x
                     root.hoverX = mouse.x - 8
                     root.hoverY = mouse.y - 8
                     candleCanvas.requestPaint()
                 }
-                onPositionChanged: {
+                onPositionChanged: function(mouse) {
                     root.hoverX = mouse.x - 8
                     root.hoverY = mouse.y - 8
                     if (mouse.buttons & Qt.LeftButton) {
