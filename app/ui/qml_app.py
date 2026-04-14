@@ -107,6 +107,10 @@ class ResearchWorker(QObject):
     failed = Signal(str)
     currentGenerationChanged = Signal(int)
     totalGenerationsChanged = Signal(int)
+    candidateCountChanged = Signal(int)
+    evaluatedCountChanged = Signal(int)
+    survivedCountChanged = Signal(int)
+    rejectedCountChanged = Signal(int)
 
     def __init__(
         self,
@@ -255,6 +259,14 @@ class ResearchWorker(QObject):
             self.stage.emit("Strategy generation")
             self.log.emit("INFO", "strategy generation started")
             self.totalGenerationsChanged.emit(int(self.generations))
+            candidate_count = 0
+            evaluated_count = 0
+            survived_count = 0
+            rejected_count = 0
+            self.candidateCountChanged.emit(candidate_count)
+            self.evaluatedCountChanged.emit(evaluated_count)
+            self.survivedCountChanged.emit(survived_count)
+            self.rejectedCountChanged.emit(rejected_count)
             generation_fitness: list[float] = []
             seed_pool: list[dict] = []
             last_top = None
@@ -364,6 +376,8 @@ class ResearchWorker(QObject):
                 )
                 for _, row in all_variants.iterrows():
                     strategy_counter += 1
+                    candidate_count += 1
+                    evaluated_count += 1
                     params = dict(row["params"])
                     context = {
                         "ctx_high_vol_avg_return": row.get("ctx_high_vol_avg_return", 0.0),
@@ -377,6 +391,14 @@ class ResearchWorker(QObject):
                     }
                     explanation = self._strategy_explanation(str(row["template_key"]), params, context=context)
                     key_sig = (str(row["template_key"]), str(sorted(params.items())))
+                    if key_sig in survivors:
+                        survived_count += 1
+                    else:
+                        rejected_count += 1
+                    self.candidateCountChanged.emit(candidate_count)
+                    self.evaluatedCountChanged.emit(evaluated_count)
+                    self.survivedCountChanged.emit(survived_count)
+                    self.rejectedCountChanged.emit(rejected_count)
                     sig = f"{row['template_key']}|{json.dumps(params, sort_keys=True)}"
                     payload = {
                         "id": strategy_ids.get(sig, f"GEN{gen}-{strategy_counter:04d}"),
@@ -716,6 +738,10 @@ class AppState(QObject):
     cpuThrottleChanged = Signal()
     currentGenerationChanged = Signal()
     totalGenerationsChanged = Signal()
+    candidateCountChanged = Signal()
+    evaluatedCountChanged = Signal()
+    survivedCountChanged = Signal()
+    rejectedCountChanged = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -762,6 +788,10 @@ class AppState(QObject):
         self._research_rows = 0
         self._current_generation = 0
         self._total_generations = 0
+        self._candidate_count = 0
+        self._evaluated_count = 0
+        self._survived_count = 0
+        self._rejected_count = 0
         self._rank_tick = 0
         self._rank_tracker: dict[str, dict] = {}
         self._elite_pool: dict[str, dict] = {}
@@ -840,6 +870,22 @@ class AppState(QObject):
     @Property(int, notify=totalGenerationsChanged)
     def totalGenerations(self):
         return int(self._total_generations)
+
+    @Property(int, notify=candidateCountChanged)
+    def candidateCount(self):
+        return int(self._candidate_count)
+
+    @Property(int, notify=evaluatedCountChanged)
+    def evaluatedCount(self):
+        return int(self._evaluated_count)
+
+    @Property(int, notify=survivedCountChanged)
+    def survivedCount(self):
+        return int(self._survived_count)
+
+    @Property(int, notify=rejectedCountChanged)
+    def rejectedCount(self):
+        return int(self._rejected_count)
 
 
     @Property(str, notify=chartTimeframeChanged)
@@ -1079,8 +1125,16 @@ class AppState(QObject):
         self._mutation_feedback = {}
         self._current_generation = 0
         self._total_generations = 0
+        self._candidate_count = 0
+        self._evaluated_count = 0
+        self._survived_count = 0
+        self._rejected_count = 0
         self.currentGenerationChanged.emit()
         self.totalGenerationsChanged.emit()
+        self.candidateCountChanged.emit()
+        self.evaluatedCountChanged.emit()
+        self.survivedCountChanged.emit()
+        self.rejectedCountChanged.emit()
         self.strategiesChanged.emit()
         self.selectedStrategyChanged.emit()
         self.fitnessSeriesChanged.emit()
@@ -1127,6 +1181,10 @@ class AppState(QObject):
         self._worker.stage.connect(self._set_stage)
         self._worker.currentGenerationChanged.connect(self._on_current_generation_changed)
         self._worker.totalGenerationsChanged.connect(self._on_total_generations_changed)
+        self._worker.candidateCountChanged.connect(self._on_candidate_count_changed)
+        self._worker.evaluatedCountChanged.connect(self._on_evaluated_count_changed)
+        self._worker.survivedCountChanged.connect(self._on_survived_count_changed)
+        self._worker.rejectedCountChanged.connect(self._on_rejected_count_changed)
         self._worker.strategy.connect(self._on_strategy)
         self._worker.ai_epoch.connect(self._on_ai_epoch)
         self._worker.finished.connect(self._on_finished)
@@ -1552,6 +1610,26 @@ class AppState(QObject):
     def _on_total_generations_changed(self, value: int):
         self._total_generations = int(max(0, value))
         self.totalGenerationsChanged.emit()
+
+    @Slot(int)
+    def _on_candidate_count_changed(self, value: int):
+        self._candidate_count = int(max(0, value))
+        self.candidateCountChanged.emit()
+
+    @Slot(int)
+    def _on_evaluated_count_changed(self, value: int):
+        self._evaluated_count = int(max(0, value))
+        self.evaluatedCountChanged.emit()
+
+    @Slot(int)
+    def _on_survived_count_changed(self, value: int):
+        self._survived_count = int(max(0, value))
+        self.survivedCountChanged.emit()
+
+    @Slot(int)
+    def _on_rejected_count_changed(self, value: int):
+        self._rejected_count = int(max(0, value))
+        self.rejectedCountChanged.emit()
 
     @Slot(object, object)
     def _on_dataset_loaded(self, df: object, profile: object):
