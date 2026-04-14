@@ -439,7 +439,45 @@ class ResearchWorker(QObject):
                     chunk_rows_processed = 0
                     chunk_counter = 0
                     agg_rows: dict[str, dict] = {}
-                    candidate_defs: list[dict] = []
+                    proposal_chunk_limit = 4
+                    proposal_frames: list[pd.DataFrame] = []
+                    proposal_rows = 0
+                    proposal_chunks_used = 0
+                    for proposal_idx, proposal_chunk in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
+                        if self._cancel:
+                            return
+                        proposal_frames.append(proposal_chunk)
+                        proposal_rows += int(len(proposal_chunk))
+                        proposal_chunks_used = proposal_idx
+                        if proposal_idx >= proposal_chunk_limit:
+                            break
+                    if not proposal_frames:
+                        raise RuntimeError("No proposal chunks available for full-data evolution")
+                    proposal_df = pd.concat(proposal_frames, ignore_index=True)
+                    proposal_featured_df, _ = generate_features(proposal_df, selected_features)
+                    proposal_all, _ = evolve_templates(
+                        proposal_featured_df,
+                        top_k=self.population_top_k,
+                        min_trades=50,
+                        result_cb=None,
+                        constraint_cb=lambda message: self.log.emit("WARN", str(message)),
+                        progress_cb=lambda idx, total, name: self._resources.cooperative_yield("Backtesting", idx, total, name),
+                        seed_pool=seed_pool,
+                        max_variants=180,
+                        exploration_strength=max(0.1, 1.0 - ((gen - 1) / max(1, self.generations - 1))),
+                        mutation_only_from_seed=(gen > 1),
+                        cooperative_cb=lambda stage, idx, total, detail: self._resources.cooperative_yield("Evolution", idx, total, detail),
+                    )
+                    candidate_defs: list[dict] = proposal_all[["strategy", "template_key", "params", "origin", "mutation_type", "parent_id", "complexity_score"]].to_dict("records")
+                    self.totalCandidatesChanged.emit(int(len(candidate_defs)))
+                    self.log.emit(
+                        "INFO",
+                        f"full-data proposal sample: chunks={proposal_chunks_used} rows={proposal_rows:,} "
+                        f"candidate_count={len(candidate_defs):,} (bounded multi-chunk proposal)",
+                    )
+                    self.log.emit("INFO", "full-data global evaluation continues across all dataset chunks")
+                    if not candidate_defs:
+                        raise RuntimeError("No proposal candidates generated for full-data evolution")
                     for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
                         if self._cancel:
                             return
@@ -450,24 +488,6 @@ class ResearchWorker(QObject):
                         chunk_rows_processed += chunk_rows
                         self.rowsProcessedChanged.emit(int(chunk_rows_processed))
                         chunk_featured_df, _ = generate_features(chunk_df, selected_features)
-                        if chunk_idx == 1:
-                            chunk_all, _ = evolve_templates(
-                                chunk_featured_df,
-                                top_k=self.population_top_k,
-                                min_trades=50,
-                                result_cb=None,
-                                constraint_cb=lambda message: self.log.emit("WARN", str(message)),
-                                progress_cb=lambda idx, total, name: self._resources.cooperative_yield("Backtesting", idx, total, name),
-                                seed_pool=seed_pool,
-                                max_variants=180,
-                                exploration_strength=max(0.1, 1.0 - ((gen - 1) / max(1, self.generations - 1))),
-                                mutation_only_from_seed=(gen > 1),
-                                cooperative_cb=lambda stage, idx, total, detail: self._resources.cooperative_yield("Evolution", idx, total, detail),
-                            )
-                            candidate_defs = chunk_all[["strategy", "template_key", "params", "origin", "mutation_type", "parent_id", "complexity_score"]].to_dict("records")
-                            self.totalCandidatesChanged.emit(int(len(candidate_defs)))
-                        if not candidate_defs:
-                            continue
                         for cand_idx, cand in enumerate(candidate_defs, start=1):
                             if self._cancel:
                                 return
