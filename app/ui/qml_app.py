@@ -508,13 +508,22 @@ class ResearchWorker(QObject):
                     self.startupPhaseChanged.emit("proposal feature generation completed")
                     self.log.emit("INFO", "proposal feature generation completed")
                     self.startupPhaseChanged.emit("proposal candidate generation started")
-                    self.log.emit("INFO", "proposal candidate generation started")
+                    proposal_min_trades = 1
+                    final_global_min_trades = 50
+                    self.log.emit(
+                        "INFO",
+                        f"proposal candidate generation started (proposal_min_trades={proposal_min_trades})",
+                    )
+                    self.log.emit(
+                        "INFO",
+                        f"full-data final evaluation min_trades rule: {final_global_min_trades}",
+                    )
                     proposal_all, _ = evolve_templates(
                         proposal_featured_df,
                         top_k=self.population_top_k,
-                        min_trades=50,
+                        min_trades=proposal_min_trades,
                         result_cb=None,
-                        constraint_cb=lambda message: self.log.emit("WARN", str(message)),
+                        constraint_cb=lambda message: self.log.emit("WARN", f"Proposal rejection: {message}"),
                         progress_cb=lambda idx, total, name: self._resources.cooperative_yield("Backtesting", idx, total, name),
                         seed_pool=seed_pool,
                         max_variants=180,
@@ -669,11 +678,19 @@ class ResearchWorker(QObject):
                         )
                     if not agg_rows:
                         raise RuntimeError("No strategy variants generated in full-data chunk evolution")
+                    self.log.emit(
+                        "INFO",
+                        f"Applying final full-data trade filter: min_trades={final_global_min_trades}",
+                    )
                     merged_rows = []
                     for sig, state in agg_rows.items():
                         total_trades = int(state["trade_sum"])
-                        if total_trades < 50:
-                            self.log.emit("WARN", f"Strategy rejected: insufficient trades ({total_trades} < 50) template={state['template_key']}")
+                        if total_trades < final_global_min_trades:
+                            self.log.emit(
+                                "WARN",
+                                f"Final rejection after full-data evaluation: insufficient trades "
+                                f"({total_trades} < {final_global_min_trades}) template={state['template_key']}",
+                            )
                             continue
                         wins_sum = int(state["wins_sum"])
                         loss_sum = int(state["loss_sum"])
