@@ -111,6 +111,7 @@ class ResearchWorker(QObject):
     evaluatedCountChanged = Signal(int)
     survivedCountChanged = Signal(int)
     rejectedCountChanged = Signal(int)
+    bestScoreChanged = Signal(float)
 
     def __init__(
         self,
@@ -263,6 +264,7 @@ class ResearchWorker(QObject):
             evaluated_count = 0
             survived_count = 0
             rejected_count = 0
+            best_score = float("-inf")
             self.candidateCountChanged.emit(candidate_count)
             self.evaluatedCountChanged.emit(evaluated_count)
             self.survivedCountChanged.emit(survived_count)
@@ -378,6 +380,10 @@ class ResearchWorker(QObject):
                     strategy_counter += 1
                     candidate_count += 1
                     evaluated_count += 1
+                    candidate_score = float(row.get("fitness", 0.0))
+                    if candidate_score > best_score:
+                        best_score = candidate_score
+                        self.bestScoreChanged.emit(float(best_score))
                     params = dict(row["params"])
                     context = {
                         "ctx_high_vol_avg_return": row.get("ctx_high_vol_avg_return", 0.0),
@@ -742,6 +748,7 @@ class AppState(QObject):
     evaluatedCountChanged = Signal()
     survivedCountChanged = Signal()
     rejectedCountChanged = Signal()
+    bestScoreChanged = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -792,6 +799,7 @@ class AppState(QObject):
         self._evaluated_count = 0
         self._survived_count = 0
         self._rejected_count = 0
+        self._best_score = 0.0
         self._rank_tick = 0
         self._rank_tracker: dict[str, dict] = {}
         self._elite_pool: dict[str, dict] = {}
@@ -886,6 +894,10 @@ class AppState(QObject):
     @Property(int, notify=rejectedCountChanged)
     def rejectedCount(self):
         return int(self._rejected_count)
+
+    @Property(float, notify=bestScoreChanged)
+    def bestScore(self):
+        return float(self._best_score)
 
 
     @Property(str, notify=chartTimeframeChanged)
@@ -1129,12 +1141,14 @@ class AppState(QObject):
         self._evaluated_count = 0
         self._survived_count = 0
         self._rejected_count = 0
+        self._best_score = 0.0
         self.currentGenerationChanged.emit()
         self.totalGenerationsChanged.emit()
         self.candidateCountChanged.emit()
         self.evaluatedCountChanged.emit()
         self.survivedCountChanged.emit()
         self.rejectedCountChanged.emit()
+        self.bestScoreChanged.emit()
         self.strategiesChanged.emit()
         self.selectedStrategyChanged.emit()
         self.fitnessSeriesChanged.emit()
@@ -1185,6 +1199,7 @@ class AppState(QObject):
         self._worker.evaluatedCountChanged.connect(self._on_evaluated_count_changed)
         self._worker.survivedCountChanged.connect(self._on_survived_count_changed)
         self._worker.rejectedCountChanged.connect(self._on_rejected_count_changed)
+        self._worker.bestScoreChanged.connect(self._on_best_score_changed)
         self._worker.strategy.connect(self._on_strategy)
         self._worker.ai_epoch.connect(self._on_ai_epoch)
         self._worker.finished.connect(self._on_finished)
@@ -1630,6 +1645,11 @@ class AppState(QObject):
     def _on_rejected_count_changed(self, value: int):
         self._rejected_count = int(max(0, value))
         self.rejectedCountChanged.emit()
+
+    @Slot(float)
+    def _on_best_score_changed(self, value: float):
+        self._best_score = float(value)
+        self.bestScoreChanged.emit()
 
     @Slot(object, object)
     def _on_dataset_loaded(self, df: object, profile: object):
