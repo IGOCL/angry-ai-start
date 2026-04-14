@@ -591,6 +591,11 @@ def evaluate_template(
     full_result = run_backtest(staged, cfg)
     train_result = run_backtest(train_df, cfg)
     test_result = run_backtest(test_df, cfg)
+    long_signals = int(pd.to_numeric(staged.get("long_entry", 0), errors="coerce").fillna(0).astype(bool).sum())
+    short_signals = int(pd.to_numeric(staged.get("short_entry", 0), errors="coerce").fillna(0).astype(bool).sum())
+    total_entry_signals = int(long_signals + short_signals)
+    executed_trades_full = int(full_result.metrics.get("total_trades", 0))
+    filtered_signals = int(max(0, total_entry_signals - executed_trades_full))
 
     template = _template_by_key(template_key)
     merged_params = dict(template.params)
@@ -607,6 +612,13 @@ def evaluate_template(
         "test": test_result,
         "robustness_score": robustness,
         "performance_context": perf_context,
+        "signal_diagnostics": {
+            "total_entry_signals": total_entry_signals,
+            "long_entry_signals": long_signals,
+            "short_entry_signals": short_signals,
+            "executed_trades_full": executed_trades_full,
+            "filtered_signals_estimate": filtered_signals,
+        },
     }
 
 
@@ -829,8 +841,10 @@ def evolve_templates(
     df: pd.DataFrame,
     config: BacktestConfig | None = None,
     top_k: int = 8,
+    min_trades: int = 50,
     progress_cb=None,
     result_cb=None,
+    constraint_cb=None,
     seed_pool: list[dict[str, Any]] | None = None,
     max_variants: int = 500,
     exploration_strength: float = 0.0,
@@ -839,6 +853,7 @@ def evolve_templates(
     cooperative_cb=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     cfg = config or BacktestConfig()
+    min_trades = max(1, int(min_trades))
     all_rows: list[dict[str, Any]] = []
     rng = np.random.default_rng(42 + len(df) + top_k)
 
@@ -956,7 +971,19 @@ def evolve_templates(
             evaluated = evaluate_template(df, t.key, params=params, config=cfg)
             test = evaluated["test"].metrics
             perf_context = dict(evaluated.get("performance_context", {}))
+            signal_diag = dict(evaluated.get("signal_diagnostics", {}))
             test_trades = evaluated["test"].trades
+            observed_trades = int(test.get("total_trades", 0))
+            if observed_trades < min_trades:
+                if constraint_cb is not None:
+                    try:
+                        constraint_cb(
+                            f"Strategy rejected: insufficient trades ({observed_trades} < {min_trades}) "
+                            f"strategy={t.name} template={t.key}"
+                        )
+                    except Exception:
+                        pass
+                continue
             avg_trade_return_pct = float(test_trades["return_pct"].mean()) if not test_trades.empty else 0.0
             max_win_pct = float(test_trades["return_pct"].max()) if not test_trades.empty else 0.0
             max_loss_pct = float(test_trades["return_pct"].min()) if not test_trades.empty else 0.0
@@ -991,6 +1018,8 @@ def evolve_templates(
                 "test_max_loss_pct": max_loss_pct,
                 "test_win_trades": wins,
                 "test_loss_trades": losses,
+                "entry_signals": int(signal_diag.get("total_entry_signals", 0)),
+                "filtered_signals": int(signal_diag.get("filtered_signals_estimate", 0)),
                 "ctx_high_vol_avg_return": float(perf_context.get("high_vol_avg_return", 0.0)),
                 "ctx_low_vol_avg_return": float(perf_context.get("low_vol_avg_return", 0.0)),
                 "ctx_trending_avg_return": float(perf_context.get("trending_avg_return", 0.0)),

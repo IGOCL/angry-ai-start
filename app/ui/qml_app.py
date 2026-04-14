@@ -4,6 +4,9 @@ import json
 import hashlib
 import sys
 import time
+import logging
+import re
+from collections import deque
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from dataclasses import asdict
@@ -15,11 +18,15 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 
 from app.core.ai_engine import analyze_market_ai
-from app.core.data_loader import load_market_file_minimal
+from app.core.data_loader import load_market_file_minimal, iter_market_file_minimal_chunks, iterate_dataset_chunks
 from app.core.feature_engine import generate_features
-from app.core.strategy_engine import evolve_templates, walk_forward_validate, TEMPLATES
+from app.core.strategy_engine import evaluate_template, evolve_templates, walk_forward_validate, TEMPLATES
 from app.core.chart_adapter import build_candle_payload
 
+try:
+    import psutil
+except Exception:  # optional dependency for cross-platform memory checks
+    psutil = None
 
 class ResourceController:
     def __init__(self, ram_limit_gb: float, cpu_throttle: int, log_cb=None, stage_cb=None):
@@ -29,21 +36,33 @@ class ResourceController:
         self.stage_cb = stage_cb
         self._last_log_ts = 0.0
         self._last_stage_ts = 0.0
+        self._psutil_warned = False
 
     def update(self, ram_limit_gb: float, cpu_throttle: int):
         self.ram_limit_gb = max(0.25, float(ram_limit_gb))
         self.cpu_throttle = max(0, min(95, int(cpu_throttle)))
 
     def memory_usage_gb(self) -> float:
+        if psutil is None:
+            if not self._psutil_warned:
+                msg = "psutil is not installed; RAM limiter is using fallback usage=0.0GB"
+                if self.log_cb is not None:
+                    self.log_cb("WARN", msg)
+                else:
+                    logging.getLogger(__name__).warning(msg)
+                self._psutil_warned = True
+            return 0.0
+
         try:
-            with open("/proc/self/status", "r", encoding="utf-8") as fh:
-                for line in fh:
-                    if line.startswith("VmRSS:"):
-                        kb = float(line.split()[1])
-                        return kb / (1024.0 * 1024.0)
-        except Exception:
-            pass
-        return 0.0
+            rss_bytes = float(psutil.Process().memory_info().rss)
+            return rss_bytes / (1024.0 ** 3)
+        except Exception as exc:
+            msg = f"Unable to read RAM usage via psutil; using fallback usage=0.0GB ({exc})"
+            if self.log_cb is not None:
+                self.log_cb("WARN", msg)
+            else:
+                logging.getLogger(__name__).warning(msg)
+            return 0.0
 
     def cooperative_yield(self, stage: str, current: int, total: int, detail: str = ""):
         throttle = max(0.0, self.cpu_throttle / 100.0)
@@ -56,17 +75,20 @@ class ResourceController:
         high_watermark = self.ram_limit_gb * 0.90
         over_limit = mem_gb >= self.ram_limit_gb
         near_limit = mem_gb >= high_watermark
+        limiter_state = "LIMIT EXCEEDED" if over_limit else ("NEAR LIMIT" if near_limit else "NORMAL")
+
         if near_limit:
             extra_delay = 0.020 if over_limit else 0.010
             time.sleep(extra_delay)
-            now = time.time()
-            if self.log_cb is not None and now - self._last_log_ts > 1.0:
-                status = "exceeded" if over_limit else "near"
-                self.log_cb(
-                    "WARN",
-                    f"RAM limiter active ({status} limit): usage={mem_gb:.2f}GB limit={self.ram_limit_gb:.2f}GB stage={stage}",
-                )
-                self._last_log_ts = now
+
+        now = time.time()
+        if self.log_cb is not None and now - self._last_log_ts > 1.0:
+            level = "WARN" if near_limit else "INFO"
+            self.log_cb(
+                level,
+                f"RAM usage={mem_gb:.2f}GB limit={self.ram_limit_gb:.2f}GB state={limiter_state} stage={stage}",
+            )
+            self._last_log_ts = now
 
         now = time.time()
         if self.stage_cb is not None and (current <= 1 or current >= total or now - self._last_stage_ts > 0.35):
@@ -83,8 +105,28 @@ class ResearchWorker(QObject):
     strategy = Signal(object)
     stage = Signal(str)
     ai_epoch = Signal(object)
+    aiStateChanged = Signal(str)
     finished = Signal(object)
     failed = Signal(str)
+    currentGenerationChanged = Signal(int)
+    totalGenerationsChanged = Signal(int)
+    candidateCountChanged = Signal(int)
+    evaluatedCountChanged = Signal(int)
+    survivedCountChanged = Signal(int)
+    rejectedCountChanged = Signal(int)
+    bestScoreChanged = Signal(float)
+    generationBestScoreChanged = Signal(float)
+    bestScoreProgressChanged = Signal(float)
+    bestStrategyChanged = Signal(str)
+    currentChunkChanged = Signal(int)
+    totalChunksChanged = Signal(int)
+    rowsProcessedChanged = Signal(int)
+    currentCandidateChanged = Signal(int)
+    totalCandidatesChanged = Signal(int)
+    activeTemplateChanged = Signal(str)
+    startupPhaseChanged = Signal(str)
+    proposalChunksProcessedChanged = Signal(int)
+    proposalRowsAccumulatedChanged = Signal(int)
 
     def __init__(
         self,
@@ -94,12 +136,18 @@ class ResearchWorker(QObject):
         model_type: str,
         max_ram_gb: float = 4.0,
         cpu_throttle: int = 0,
+        input_df: pd.DataFrame | None = None,
+        input_profile: dict | None = None,
+        full_data_mode: bool = False,
     ):
         super().__init__()
         self.dataset_path = dataset_path
         self.generations = generations
         self.population_top_k = population_top_k
         self.model_type = model_type
+        self.input_df = input_df
+        self.input_profile = dict(input_profile or {})
+        self.full_data_mode = bool(full_data_mode)
         self._cancel = False
         self._resources = ResourceController(max_ram_gb, cpu_throttle, log_cb=self.log.emit, stage_cb=self.stage.emit)
 
@@ -170,28 +218,92 @@ class ResearchWorker(QObject):
     @Slot()
     def run(self):
         try:
-            if not self.dataset_path:
-                raise ValueError("No dataset selected. Enter a CSV/Parquet path in the top bar.")
-            if not Path(self.dataset_path).exists():
-                raise ValueError(f"Dataset not found: {self.dataset_path}")
+            self.aiStateChanged.emit("idle")
+            self.currentChunkChanged.emit(0)
+            self.totalChunksChanged.emit(0)
+            self.rowsProcessedChanged.emit(0)
+            self.currentCandidateChanged.emit(0)
+            self.totalCandidatesChanged.emit(0)
+            self.activeTemplateChanged.emit("n/a")
+            self.startupPhaseChanged.emit("idle")
+            self.proposalChunksProcessedChanged.emit(0)
+            self.proposalRowsAccumulatedChanged.emit(0)
+            if self.full_data_mode:
+                self.log.emit("INFO", "Research branch: full-data incremental mode")
+                if not self.dataset_path:
+                    raise ValueError("No dataset selected. Enter a CSV/Parquet path in the top bar.")
+                if not Path(self.dataset_path).exists():
+                    raise ValueError(f"Dataset not found: {self.dataset_path}")
+                full_data_chunk_size = 150_000
+                self.stage.emit("Full-data processing")
+                self.log.emit("INFO", "Full-data processing started")
+                processed_rows = 0
+                chunk_count = 0
+                rolling_max_rows = 300_000
+                rolling_chunks = deque()
+                rolling_rows = 0
+                for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=full_data_chunk_size), start=1):
+                    if self._cancel:
+                        return
+                    chunk_count = chunk_idx
+                    chunk_rows = int(len(chunk_df))
+                    processed_rows += chunk_rows
+                    rolling_chunks.append(chunk_df)
+                    rolling_rows += chunk_rows
+                    while rolling_rows > rolling_max_rows and rolling_chunks:
+                        left_chunk = rolling_chunks.popleft()
+                        left_rows = int(len(left_chunk))
+                        excess_rows = rolling_rows - rolling_max_rows
+                        if excess_rows < left_rows:
+                            trimmed_chunk = left_chunk.iloc[excess_rows:].copy(deep=False)
+                            trimmed_rows = int(len(trimmed_chunk))
+                            rolling_chunks.appendleft(trimmed_chunk)
+                            rolling_rows -= (left_rows - trimmed_rows)
+                        else:
+                            rolling_rows -= left_rows
+                    self._resources.cooperative_yield(
+                        "Full-data processing",
+                        max(1, processed_rows),
+                        max(1, processed_rows),
+                        f"chunk={chunk_idx:,} rolling_rows={rolling_rows:,}",
+                    )
+                    self.log.emit(
+                        "INFO",
+                        f"Processing chunk {chunk_idx}, chunk rows {chunk_rows:,}, rows processed {processed_rows:,}, rolling working rows {rolling_rows:,}",
+                    )
+                if not rolling_chunks:
+                    raise RuntimeError("Full-data processing produced no chunks")
+                df = pd.concat(list(rolling_chunks), ignore_index=True)
+                self.log.emit("INFO", "Full-data processing complete")
+                profile = {"synthetic_pct": float(pd.to_numeric(df.get("synthetic", 0), errors="coerce").fillna(0).mean() * 100.0) if "synthetic" in df.columns else 0.0}
+                self.log.emit("INFO", f"full-data incremental summary: chunks={chunk_count} rows_processed={processed_rows:,}")
+                self.log.emit("INFO", f"final research input rows {len(df):,}")
+            elif self.input_df is not None:
+                self.log.emit("INFO", "Research branch: preview/preloaded mode")
+                df = self.input_df
+                profile = self.input_profile
+                self.log.emit("INFO", f"dataset ready (preloaded): rows={len(df):,}")
+            else:
+                self.log.emit("INFO", "Research branch: preview/preloaded mode")
+                self.stage.emit("Dataset load")
+                self.log.emit("INFO", "dataset load started")
+                load_started_at = time.perf_counter()
 
-            self.stage.emit("Dataset load")
-            self.log.emit("INFO", "dataset load started")
-            load_started_at = time.perf_counter()
+                def _load_progress(rows_loaded: int, total_rows: int, detail: str):
+                    self._resources.cooperative_yield("Dataset load", max(1, rows_loaded), max(1, total_rows or rows_loaded), detail)
+                    if rows_loaded % 200000 == 0:
+                        elapsed = max(1e-9, time.perf_counter() - load_started_at)
+                        self.log.emit("INFO", f"dataset load progress: rows={rows_loaded:,} speed={int(rows_loaded/elapsed):,}/s")
 
-            def _load_progress(rows_loaded: int, total_rows: int, detail: str):
-                self._resources.cooperative_yield("Dataset load", max(1, rows_loaded), max(1, total_rows or rows_loaded), detail)
-                if rows_loaded % 200000 == 0:
-                    elapsed = max(1e-9, time.perf_counter() - load_started_at)
-                    self.log.emit("INFO", f"dataset load progress: rows={rows_loaded:,} speed={int(rows_loaded/elapsed):,}/s")
-
-            df, profile = load_market_file_minimal(
-                self.dataset_path,
-                progress_cb=_load_progress,
-                cancel_cb=lambda: self._cancel,
-                chunk_size=150_000,
-            )
-            self.log.emit("INFO", f"dataset ready: rows={len(df):,} synthetic={profile.synthetic_pct:.2f}%")
+                df, profile_obj = load_market_file_minimal(
+                    self.dataset_path,
+                    progress_cb=_load_progress,
+                    cancel_cb=lambda: self._cancel,
+                    chunk_size=150_000,
+                )
+                profile = asdict(profile_obj)
+            synthetic_pct = float(profile.get("synthetic_pct", 0.0)) if isinstance(profile, dict) else float(profile.synthetic_pct)
+            self.log.emit("INFO", f"dataset ready: rows={len(df):,} synthetic={synthetic_pct:.2f}%")
             if self._cancel:
                 return
 
@@ -214,19 +326,37 @@ class ResearchWorker(QObject):
                 return
 
             working_df = featured_df
-            if len(working_df) > 10000:
+            if self.full_data_mode:
+                self.log.emit(
+                    "INFO",
+                    f"Full-data research mode active: research rows actually used={len(working_df):,} (no 10,000-row downsample applied)",
+                )
+            elif len(working_df) > 10000:
                 stride = max(1, len(working_df) // 10000)
                 working_df = working_df.iloc[::stride].reset_index(drop=True)
                 self.log.emit("WARN", f"Downsampled research rows for responsiveness: {len(featured_df):,}->{len(working_df):,}")
 
             self.stage.emit("Strategy generation")
             self.log.emit("INFO", "strategy generation started")
+            self.totalGenerationsChanged.emit(int(self.generations))
+            candidate_count = 0
+            evaluated_count = 0
+            survived_count = 0
+            rejected_count = 0
+            best_score = float("-inf")
+            self.candidateCountChanged.emit(candidate_count)
+            self.evaluatedCountChanged.emit(evaluated_count)
+            self.survivedCountChanged.emit(survived_count)
+            self.rejectedCountChanged.emit(rejected_count)
             generation_fitness: list[float] = []
             seed_pool: list[dict] = []
             last_top = None
             strategy_counter = 0
 
             for gen in range(1, self.generations + 1):
+                self.currentGenerationChanged.emit(int(gen))
+                generation_best_score = float("-inf")
+                self.generationBestScoreChanged.emit(0.0)
                 if self._cancel:
                     return
                 self.stage.emit(f"Backtest generation {gen}/{self.generations}")
@@ -305,17 +435,233 @@ class ResearchWorker(QObject):
                         f"win={payload['win_rate']:.2f}% pnl={payload['pnl']:.2f}% dd={payload['drawdown']:.2f}%"
                     )
 
-                all_variants, top_variants = evolve_templates(
-                    working_df,
-                    top_k=self.population_top_k,
-                    result_cb=_emit_streamed_variant,
-                    progress_cb=lambda idx, total, name: self._resources.cooperative_yield("Backtesting", idx, total, name),
-                    seed_pool=seed_pool,
-                    max_variants=180,
-                    exploration_strength=max(0.1, 1.0 - ((gen - 1) / max(1, self.generations - 1))),
-                    mutation_only_from_seed=(gen > 1),
-                    cooperative_cb=lambda stage, idx, total, detail: self._resources.cooperative_yield("Evolution", idx, total, detail),
-                )
+                if self.full_data_mode and self.dataset_path:
+                    self.log.emit("INFO", f"full-data evolution mode active: generation={gen} processing all dataset chunks")
+                    chunk_rows_processed = 0
+                    chunk_counter = 0
+                    agg_rows: dict[str, dict] = {}
+                    proposal_chunk_limit = 4
+                    proposal_frames: list[pd.DataFrame] = []
+                    proposal_rows = 0
+                    proposal_chunks_used = 0
+                    self.startupPhaseChanged.emit("proposal sample collection started")
+                    self.log.emit("INFO", "proposal sample collection started")
+                    for proposal_idx, proposal_chunk in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
+                        if self._cancel:
+                            return
+                        proposal_frames.append(proposal_chunk)
+                        proposal_rows += int(len(proposal_chunk))
+                        proposal_chunks_used = proposal_idx
+                        self.proposalChunksProcessedChanged.emit(int(proposal_chunks_used))
+                        self.proposalRowsAccumulatedChanged.emit(int(proposal_rows))
+                        self.startupPhaseChanged.emit(f"proposal chunk {proposal_idx}/{proposal_chunk_limit}")
+                        self.log.emit("INFO", f"proposal chunk {proposal_idx}/{proposal_chunk_limit} rows_accumulated={proposal_rows:,}")
+                        if proposal_idx >= proposal_chunk_limit:
+                            break
+                    if not proposal_frames:
+                        raise RuntimeError("No proposal chunks available for full-data evolution")
+                    self.startupPhaseChanged.emit("proposal feature generation started")
+                    self.log.emit("INFO", "proposal feature generation started")
+                    proposal_df = pd.concat(proposal_frames, ignore_index=True)
+                    proposal_featured_df, _ = generate_features(proposal_df, selected_features)
+                    self.startupPhaseChanged.emit("proposal feature generation completed")
+                    self.log.emit("INFO", "proposal feature generation completed")
+                    self.startupPhaseChanged.emit("proposal candidate generation started")
+                    self.log.emit("INFO", "proposal candidate generation started")
+                    proposal_all, _ = evolve_templates(
+                        proposal_featured_df,
+                        top_k=self.population_top_k,
+                        min_trades=50,
+                        result_cb=None,
+                        constraint_cb=lambda message: self.log.emit("WARN", str(message)),
+                        progress_cb=lambda idx, total, name: self._resources.cooperative_yield("Backtesting", idx, total, name),
+                        seed_pool=seed_pool,
+                        max_variants=180,
+                        exploration_strength=max(0.1, 1.0 - ((gen - 1) / max(1, self.generations - 1))),
+                        mutation_only_from_seed=(gen > 1),
+                        cooperative_cb=lambda stage, idx, total, detail: self._resources.cooperative_yield("Evolution", idx, total, detail),
+                    )
+                    candidate_defs: list[dict] = proposal_all[["strategy", "template_key", "params", "origin", "mutation_type", "parent_id", "complexity_score"]].to_dict("records")
+                    self.totalCandidatesChanged.emit(int(len(candidate_defs)))
+                    self.startupPhaseChanged.emit("proposal candidate generation completed")
+                    self.log.emit("INFO", "proposal candidate generation completed")
+                    self.log.emit(
+                        "INFO",
+                        f"full-data proposal sample: chunks={proposal_chunks_used} rows={proposal_rows:,} "
+                        f"candidate_count={len(candidate_defs):,} (bounded multi-chunk proposal)",
+                    )
+                    self.log.emit("INFO", "full-data global evaluation continues across all dataset chunks")
+                    if not candidate_defs:
+                        raise RuntimeError("No proposal candidates generated for full-data evolution")
+                    self.startupPhaseChanged.emit("first candidate evaluation started")
+                    self.log.emit("INFO", "first candidate evaluation started")
+                    for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
+                        if self._cancel:
+                            return
+                        chunk_counter = chunk_idx
+                        self.currentChunkChanged.emit(int(chunk_idx))
+                        self.totalChunksChanged.emit(int(chunk_counter))
+                        chunk_rows = int(len(chunk_df))
+                        chunk_rows_processed += chunk_rows
+                        self.rowsProcessedChanged.emit(int(chunk_rows_processed))
+                        chunk_featured_df, _ = generate_features(chunk_df, selected_features)
+                        for cand_idx, cand in enumerate(candidate_defs, start=1):
+                            if self._cancel:
+                                return
+                            self.currentCandidateChanged.emit(int(cand_idx))
+                            tkey = str(cand.get("template_key", ""))
+                            params = dict(cand.get("params", {}))
+                            self.activeTemplateChanged.emit(str(tkey or "n/a"))
+                            evaluated = evaluate_template(chunk_featured_df, tkey, params=params)
+                            test = dict(evaluated["test"].metrics)
+                            signal_diag = dict(evaluated.get("signal_diagnostics", {}))
+                            test_trades = evaluated["test"].trades
+                            wins = int((test_trades["net_pnl"] > 0).sum()) if not test_trades.empty else 0
+                            losses = int((test_trades["net_pnl"] < 0).sum()) if not test_trades.empty else 0
+                            entry_signals = int(signal_diag.get("total_entry_signals", 0))
+                            filtered_signals = int(signal_diag.get("filtered_signals_estimate", 0))
+                            sig = f"{tkey}|{json.dumps(params, sort_keys=True)}"
+                            state = agg_rows.get(sig)
+                            if state is None:
+                                state = {
+                                    "strategy": str(cand.get("strategy", tkey)),
+                                    "template_key": tkey,
+                                    "params": params,
+                                    "origin": str(cand.get("origin", "mutation")),
+                                    "mutation_type": str(cand.get("mutation_type", "base")),
+                                    "parent_id": str(cand.get("parent_id", "none")),
+                                    "complexity_score": float(cand.get("complexity_score", 0.0)),
+                                    "robustness_sum": 0.0,
+                                    "return_sum": 0.0,
+                                    "drawdown_sum": 0.0,
+                                    "trade_sum": 0,
+                                    "wins_sum": 0,
+                                    "loss_sum": 0,
+                                    "entry_signal_sum": 0,
+                                    "filtered_signal_sum": 0,
+                                    "chunks": 0,
+                                }
+                            state["robustness_sum"] += float(evaluated.get("robustness_score", 0.0))
+                            state["return_sum"] += float(test.get("total_return_pct", 0.0))
+                            state["drawdown_sum"] += float(test.get("max_drawdown_pct", 0.0))
+                            state["trade_sum"] += int(test.get("total_trades", 0))
+                            state["wins_sum"] += int(wins)
+                            state["loss_sum"] += int(losses)
+                            state["entry_signal_sum"] += int(entry_signals)
+                            state["filtered_signal_sum"] += int(filtered_signals)
+                            state["chunks"] += 1
+                            agg_rows[sig] = state
+                            if cand_idx <= 2 and (chunk_idx == 1 or chunk_idx % 5 == 0):
+                                self.log.emit(
+                                    "INFO",
+                                    f"Candidate diag [{tkey}] chunk={chunk_idx} signals={entry_signals} "
+                                    f"trades={int(test.get('total_trades', 0))} wins={wins} losses={losses} filtered={filtered_signals}",
+                                )
+                                self.log.emit(
+                                    "INFO",
+                                    f"Chunk {chunk_idx}: cumulative_trades={state['trade_sum']:,} template={tkey}",
+                                )
+                        self.log.emit(
+                            "INFO",
+                            f"full-data evolution chunk={chunk_idx} chunk_rows={chunk_rows:,} rows_processed={chunk_rows_processed:,}",
+                        )
+                    if not agg_rows:
+                        raise RuntimeError("No strategy variants generated in full-data chunk evolution")
+                    merged_rows = []
+                    for sig, state in agg_rows.items():
+                        total_trades = int(state["trade_sum"])
+                        if total_trades < 50:
+                            self.log.emit("WARN", f"Strategy rejected: insufficient trades ({total_trades} < 50) template={state['template_key']}")
+                            continue
+                        wins_sum = int(state["wins_sum"])
+                        loss_sum = int(state["loss_sum"])
+                        denom = max(1, wins_sum + loss_sum)
+                        win_rate = float((wins_sum / denom) * 100.0)
+                        chunks = max(1, int(state["chunks"]))
+                        row = {
+                            "strategy": state["strategy"],
+                            "template_key": state["template_key"],
+                            "params": state["params"],
+                            "origin": state["origin"],
+                            "mutation_type": state["mutation_type"],
+                            "parent_id": state["parent_id"],
+                            "complexity_score": float(state["complexity_score"]),
+                            "robustness_score": float(state["robustness_sum"]) / chunks,
+                            "test_return_pct": float(state["return_sum"]),
+                            "test_win_rate_pct": win_rate,
+                            "test_max_drawdown_pct": float(state["drawdown_sum"]) / chunks,
+                            "test_trades": total_trades,
+                            "test_avg_trade_return_pct": 0.0,
+                            "test_max_win_pct": 0.0,
+                            "test_max_loss_pct": 0.0,
+                            "test_win_trades": wins_sum,
+                            "test_loss_trades": loss_sum,
+                            "entry_signals": int(state["entry_signal_sum"]),
+                            "filtered_signals": int(state["filtered_signal_sum"]),
+                            "ctx_high_vol_avg_return": 0.0,
+                            "ctx_low_vol_avg_return": 0.0,
+                            "ctx_trending_avg_return": 0.0,
+                            "ctx_ranging_avg_return": 0.0,
+                            "ctx_trend_confidence": 0.0,
+                            "ctx_volatility_confidence": 0.0,
+                            "ctx_confidence": 0.0,
+                            "ctx_time_stability": 0.0,
+                            "ctx_decay_score": 0.0,
+                            "ctx_decay_flag": False,
+                            "ctx_sample_count": 0,
+                            "ctx_return_scale": 0.0,
+                            "performance_context": f"aggregated_full_data_chunks={chunks}",
+                            "behavior_robustness": 0.0,
+                        }
+                        merged_rows.append(row)
+                    if not merged_rows:
+                        raise RuntimeError("No strategy variants passed global full-data constraints")
+                    all_variants = pd.DataFrame(merged_rows)
+                    all_variants["structure_sig"] = all_variants.apply(lambda r: f"{r['template_key']}|{json.dumps(dict(r['params']), sort_keys=True)}", axis=1)
+                    dup_counts = all_variants["structure_sig"].value_counts()
+                    fam_counts = all_variants["template_key"].value_counts()
+                    all_variants["dup_penalty"] = all_variants["structure_sig"].map(lambda s: max(0.0, float(dup_counts.get(s, 1) - 1) * 1.6))
+                    all_variants["family_penalty"] = all_variants["template_key"].map(lambda k: max(0.0, float(fam_counts.get(k, 1) / max(1, len(all_variants)) * 10.0)))
+                    all_variants["fitness"] = (
+                        all_variants["robustness_score"] * 0.50 +
+                        all_variants["test_return_pct"] * 0.30 +
+                        all_variants["test_win_rate_pct"] * 0.10 -
+                        all_variants["test_max_drawdown_pct"].abs() * 0.10 +
+                        all_variants["complexity_score"] * 0.05 -
+                        all_variants["dup_penalty"] -
+                        all_variants["family_penalty"]
+                    )
+                    all_variants = all_variants.sort_values("fitness", ascending=False).reset_index(drop=True)
+                    top_variants = all_variants.head(max(1, int(self.population_top_k))).reset_index(drop=True)
+                    if not top_variants.empty:
+                        top_diag = top_variants.iloc[0]
+                        self.log.emit(
+                            "INFO",
+                            f"Trade metric consistency: total_trades={int(top_diag.get('test_trades', 0))} "
+                            f"(filter/display aligned) signals={int(top_diag.get('entry_signals', 0))} "
+                            f"filtered={int(top_diag.get('filtered_signals', 0))}",
+                        )
+                    for streamed_idx, (_, streamed_row) in enumerate(top_variants.iterrows(), start=1):
+                        _emit_streamed_variant(streamed_idx, len(top_variants), streamed_row.to_dict())
+                    self.log.emit(
+                        "INFO",
+                        f"full-data evolution summary: generation={gen} chunks={chunk_counter} rows_processed={chunk_rows_processed:,} "
+                        f"candidates={len(all_variants):,} top={len(top_variants):,} no_10000_downsample=yes",
+                    )
+                else:
+                    all_variants, top_variants = evolve_templates(
+                        working_df,
+                        top_k=self.population_top_k,
+                        min_trades=50,
+                        result_cb=_emit_streamed_variant,
+                        constraint_cb=lambda message: self.log.emit("WARN", str(message)),
+                        progress_cb=lambda idx, total, name: self._resources.cooperative_yield("Backtesting", idx, total, name),
+                        seed_pool=seed_pool,
+                        max_variants=180,
+                        exploration_strength=max(0.1, 1.0 - ((gen - 1) / max(1, self.generations - 1))),
+                        mutation_only_from_seed=(gen > 1),
+                        cooperative_cb=lambda stage, idx, total, detail: self._resources.cooperative_yield("Evolution", idx, total, detail),
+                    )
                 if top_variants.empty:
                     raise RuntimeError("No strategy variants generated")
 
@@ -329,6 +675,16 @@ class ResearchWorker(QObject):
                 )
                 for _, row in all_variants.iterrows():
                     strategy_counter += 1
+                    candidate_count += 1
+                    evaluated_count += 1
+                    candidate_score = float(row.get("fitness", 0.0))
+                    if candidate_score > generation_best_score:
+                        generation_best_score = candidate_score
+                        self.generationBestScoreChanged.emit(float(generation_best_score))
+                    if candidate_score > best_score:
+                        best_score = candidate_score
+                        self.bestScoreChanged.emit(float(best_score))
+                        self.bestStrategyChanged.emit(str(row.get("template_key", "n/a")))
                     params = dict(row["params"])
                     context = {
                         "ctx_high_vol_avg_return": row.get("ctx_high_vol_avg_return", 0.0),
@@ -342,6 +698,14 @@ class ResearchWorker(QObject):
                     }
                     explanation = self._strategy_explanation(str(row["template_key"]), params, context=context)
                     key_sig = (str(row["template_key"]), str(sorted(params.items())))
+                    if key_sig in survivors:
+                        survived_count += 1
+                    else:
+                        rejected_count += 1
+                    self.candidateCountChanged.emit(candidate_count)
+                    self.evaluatedCountChanged.emit(evaluated_count)
+                    self.survivedCountChanged.emit(survived_count)
+                    self.rejectedCountChanged.emit(rejected_count)
                     sig = f"{row['template_key']}|{json.dumps(params, sort_keys=True)}"
                     payload = {
                         "id": strategy_ids.get(sig, f"GEN{gen}-{strategy_counter:04d}"),
@@ -399,6 +763,8 @@ class ResearchWorker(QObject):
                         }
                     )
                 seed_pool = next_seed_pool
+                if generation_best_score > float("-inf"):
+                    self.bestScoreProgressChanged.emit(float(generation_best_score))
                 self.log.emit("INFO", f"backtest completed: generation={gen} best_fitness={float(best['fitness']):.2f}")
 
             self.log.emit("INFO", f"strategy generation completed: total_candidates={strategy_counter}")
@@ -407,6 +773,7 @@ class ResearchWorker(QObject):
                 raise RuntimeError("Evolution completed with no best strategy")
 
             self.stage.emit("Validation")
+            self.aiStateChanged.emit("evaluating")
             self.log.emit("INFO", "validation started")
             validation_targets = top_variants.head(min(5, len(top_variants)))
             wf = None
@@ -487,7 +854,65 @@ class ResearchWorker(QObject):
                 wf = pd.DataFrame()
             self.log.emit("INFO", f"validation completed: walk_forward_stability={stability:.2f}")
 
+            full_data_cumulative = None
+            if self.full_data_mode and self.dataset_path:
+                self.stage.emit("Full-data accumulation")
+                self.log.emit("INFO", "full-data accumulation started")
+                cumulative_rows = 0
+                cumulative_trades = 0
+                cumulative_wins = 0
+                cumulative_losses = 0
+                cumulative_pnl = 0.0
+                wf_full_parts = []
+                template_key = str(last_top["template_key"])
+                template_params = dict(last_top["params"])
+                for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=full_data_chunk_size), start=1):
+                    if self._cancel:
+                        return
+                    chunk_rows = int(len(chunk_df))
+                    cumulative_rows += chunk_rows
+                    chunk_featured_df, _ = generate_features(chunk_df, selected_features)
+                    chunk_wf, _ = walk_forward_validate(
+                        chunk_featured_df,
+                        template_key=template_key,
+                        params=template_params,
+                        folds=4,
+                    )
+                    chunk_wf = chunk_wf.copy()
+                    chunk_wf["chunk_index"] = int(chunk_idx)
+                    wf_full_parts.append(chunk_wf)
+                    chunk_trades_series = pd.to_numeric(chunk_wf.get("trades", 0), errors="coerce").fillna(0.0)
+                    chunk_returns_series = pd.to_numeric(chunk_wf.get("return_pct", 0), errors="coerce").fillna(0.0)
+                    chunk_trades = int(chunk_trades_series.sum())
+                    chunk_pnl = float(chunk_returns_series.sum())
+                    chunk_wins = int(chunk_trades_series[chunk_returns_series > 0].sum())
+                    chunk_losses = int(chunk_trades_series[chunk_returns_series < 0].sum())
+                    cumulative_trades += chunk_trades
+                    cumulative_wins += chunk_wins
+                    cumulative_losses += chunk_losses
+                    cumulative_pnl += chunk_pnl
+                    self.log.emit(
+                        "INFO",
+                        f"full-data accumulation chunk={chunk_idx} chunk_rows={chunk_rows:,} "
+                        f"rows_processed={cumulative_rows:,} cumulative_trades={cumulative_trades:,}",
+                    )
+                if wf_full_parts:
+                    wf = pd.concat(wf_full_parts, ignore_index=True)
+                full_data_cumulative = {
+                    "rows_processed": int(cumulative_rows),
+                    "trades": int(cumulative_trades),
+                    "wins": int(cumulative_wins),
+                    "losses": int(cumulative_losses),
+                    "pnl": float(cumulative_pnl),
+                }
+                self.log.emit(
+                    "INFO",
+                    f"full-data accumulation complete: rows_processed={cumulative_rows:,} "
+                    f"trades={cumulative_trades:,} wins={cumulative_wins:,} losses={cumulative_losses:,} pnl={cumulative_pnl:.4f}",
+                )
+
             self.stage.emit("AI analysis")
+            self.aiStateChanged.emit("training")
             self.log.emit("INFO", "AI analysis started")
 
             def _epoch_cb(epoch, total, loss, acc, extra):
@@ -511,15 +936,17 @@ class ResearchWorker(QObject):
                 )
 
             ai = analyze_market_ai(working_df, model_type=self.model_type, epoch_cb=_epoch_cb)
+            self.aiStateChanged.emit("complete")
             self.log.emit("INFO", "AI analysis completed")
 
             self.stage.emit("Finalizing results")
             payload = {
-                "profile": asdict(profile),
+                "profile": dict(profile) if isinstance(profile, dict) else asdict(profile),
                 "feature_count": len(generated_cols),
                 "fitness_series": generation_fitness,
                 "wf_rows": wf.to_dict("records"),
                 "stability": float(stability),
+                "full_data_cumulative": dict(full_data_cumulative or {}),
                 "ai": {
                     "loss": ai.loss_curve,
                     "accuracy": ai.accuracy_curve,
@@ -540,7 +967,176 @@ class ResearchWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class DatasetLoadWorker(QObject):
+    log = Signal(str, str)
+    stage = Signal(str)
+    finished = Signal(object, object)
+    failed = Signal(str)
+
+    def __init__(self, dataset_path: str, max_ram_gb: float, cpu_throttle: int, dataset_row_limit: int):
+        super().__init__()
+        self.dataset_path = dataset_path
+        self.dataset_row_limit = max(10_000, int(dataset_row_limit))
+        self._resources = ResourceController(max_ram_gb, cpu_throttle, log_cb=self.log.emit, stage_cb=self.stage.emit)
+
+    @Slot()
+    def run(self):
+        try:
+            if not self.dataset_path:
+                raise ValueError("No dataset selected")
+            if not Path(self.dataset_path).exists():
+                raise ValueError(f"Dataset not found: {self.dataset_path}")
+
+            self.stage.emit("Dataset load")
+            self.log.emit("INFO", f"Loading dataset from: {self.dataset_path}")
+            self.log.emit(
+                "INFO",
+                f"Dataset load policy: recent_rows_cap={self.dataset_row_limit:,} (bounded default)",
+            )
+            started_at = time.perf_counter()
+            observed_total_rows = 0
+
+            def _progress(rows_loaded: int, total_rows: int, detail: str):
+                nonlocal observed_total_rows
+                observed_total_rows = max(observed_total_rows, int(total_rows or 0), int(rows_loaded))
+                self._resources.cooperative_yield("Dataset load", max(1, rows_loaded), max(1, total_rows or rows_loaded), detail)
+                if rows_loaded % 200000 == 0:
+                    elapsed = max(1e-9, time.perf_counter() - started_at)
+                    self.log.emit("INFO", f"dataset load progress: rows={rows_loaded:,} speed={int(rows_loaded/elapsed):,}/s")
+
+            df, profile = load_market_file_minimal(
+                self.dataset_path,
+                progress_cb=_progress,
+                chunk_size=150_000,
+                tail_rows=self.dataset_row_limit,
+            )
+            self.log.emit(
+                "INFO",
+                f"Dataset load summary: source_path={self.dataset_path} total_scan_rows="
+                f"{observed_total_rows if observed_total_rows > 0 else 'n/a'} loaded_rows={len(df):,} "
+                f"bounded_applied={'yes' if observed_total_rows > self.dataset_row_limit else 'no'} "
+                f"policy=recent_tail_rows({self.dataset_row_limit:,})",
+            )
+            profile_payload = asdict(profile)
+            profile_payload["source_total_rows"] = int(observed_total_rows or 0)
+            profile_payload["loaded_rows"] = int(len(df))
+            self.finished.emit(df, profile_payload)
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+class FullDataProcessingWorker(QObject):
+    log = Signal(str, str)
+    stage = Signal(str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, dataset_path: str, chunk_size: int = 150_000):
+        super().__init__()
+        self.dataset_path = dataset_path
+        self.chunk_size = max(10_000, int(chunk_size))
+
+    @Slot()
+    def run(self):
+        try:
+            if not self.dataset_path:
+                raise ValueError("No dataset selected")
+            if not Path(self.dataset_path).exists():
+                raise ValueError(f"Dataset not found: {self.dataset_path}")
+
+            self.stage.emit("Full-data processing")
+            self.log.emit("INFO", f"Full-data processing active: source_path={self.dataset_path}")
+            self.log.emit("INFO", f"Preview load remains bounded; full processing runs incrementally by chunks of {self.chunk_size:,} rows")
+
+            chunks = 0
+            processed_rows = 0
+            total_rows_estimate = 0
+            for _, meta in iter_market_file_minimal_chunks(self.dataset_path, chunk_size=self.chunk_size):
+                chunks += 1
+                processed_rows = int(meta.get("processed_rows", processed_rows))
+                total_rows_estimate = max(total_rows_estimate, int(meta.get("total_rows_estimate", 0) or 0))
+                self.log.emit(
+                    "INFO",
+                    f"full-data chunk progress: chunk={int(meta.get('chunk_index', chunks))}/"
+                    f"{int(meta.get('total_chunks', 0) or 0) if int(meta.get('total_chunks', 0) or 0) > 0 else 'n/a'} "
+                    f"chunk_rows={int(meta.get('chunk_rows', 0)):,} processed_rows={processed_rows:,}",
+                )
+
+            self.log.emit(
+                "INFO",
+                f"Full-data processing complete: processed_rows={processed_rows:,} "
+                f"total_rows_estimate={total_rows_estimate if total_rows_estimate > 0 else 'n/a'} chunks={chunks}",
+            )
+            self.finished.emit(
+                {
+                    "processed_rows": int(processed_rows),
+                    "total_rows_estimate": int(total_rows_estimate),
+                    "chunks": int(chunks),
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+class FeatureGenerationWorker(QObject):
+    log = Signal(str, str)
+    stage = Signal(str)
+    finished = Signal(object, object, int, int, bool)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        base_df: pd.DataFrame,
+        max_ram_gb: float,
+        cpu_throttle: int,
+        working_limit: int,
+        source_total_rows: int,
+        loaded_rows: int,
+    ):
+        super().__init__()
+        self.base_df = base_df
+        self.working_limit = int(max(1, working_limit))
+        self.source_total_rows = int(source_total_rows)
+        self.loaded_rows = int(loaded_rows)
+        self._resources = ResourceController(max_ram_gb, cpu_throttle, log_cb=self.log.emit, stage_cb=self.stage.emit)
+
+    @Slot()
+    def run(self):
+        try:
+            groups = [
+                "EMA", "SMA", "RSI", "MACD", "ATR", "BOLLINGER",
+                "VOLATILITY", "VOLUME_SPIKE", "BREAKOUT", "CANDLE_RATIOS",
+                "VWAP", "MOMENTUM", "ORDER_FLOW", "ZSCORE",
+            ]
+            total_rows = int(len(self.base_df))
+            use_slice = total_rows > self.working_limit
+            working_df = self.base_df.tail(self.working_limit).copy() if use_slice else self.base_df
+            self.log.emit("INFO", "Generating features from loaded dataset")
+            self.log.emit(
+                "INFO",
+                f"Feature working set: source_total_rows={self.source_total_rows if self.source_total_rows > 0 else 'n/a'} "
+                f"loaded_rows={self.loaded_rows:,} feature_rows={len(working_df):,} "
+                f"limit={self.working_limit:,} sliced={'yes' if use_slice else 'no'}",
+            )
+
+            def _feature_progress(idx: int, total: int, feature_name: str):
+                self._resources.cooperative_yield("Feature generation", idx, total, feature_name)
+
+            feature_df, generated_cols = generate_features(
+                working_df,
+                groups,
+                progress_cb=_feature_progress,
+                cooperative_cb=_feature_progress,
+            )
+            self.finished.emit(feature_df, generated_cols, total_rows, int(len(working_df)), use_slice)
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 class AppState(QObject):
+    DATASET_LOAD_MAX_ROWS = 500_000
+    FEATURE_WORKING_SET_MAX_ROWS = 250_000
+
     strategiesChanged = Signal()
     logsChanged = Signal()
     selectedStrategyChanged = Signal()
@@ -550,6 +1146,7 @@ class AppState(QObject):
     valLossSeriesChanged = Signal()
     valAccuracySeriesChanged = Signal()
     modelStatusChanged = Signal()
+    aiStateChanged = Signal()
     datasetPathChanged = Signal()
     stageTextChanged = Signal()
     regimeCountsChanged = Signal()
@@ -563,6 +1160,19 @@ class AppState(QObject):
     featureMetaChanged = Signal()
     maxRamGbChanged = Signal()
     cpuThrottleChanged = Signal()
+    currentGenerationChanged = Signal()
+    totalGenerationsChanged = Signal()
+    candidateCountChanged = Signal()
+    evaluatedCountChanged = Signal()
+    survivedCountChanged = Signal()
+    rejectedCountChanged = Signal()
+    bestScoreChanged = Signal()
+    generationBestScoreChanged = Signal()
+    bestStrategyTemplateChanged = Signal()
+    rowCountsChanged = Signal()
+    researchMetaChanged = Signal()
+    liveTelemetryChanged = Signal()
+    startupProgressChanged = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -577,6 +1187,7 @@ class AppState(QObject):
         self._regime_counts: dict = {}
         self._feature_importance: dict = {}
         self._model_status = "idle"
+        self._ai_state = "idle"
         self._dataset_path = ""
         self._stage_text = "Idle"
         self._profile: dict = {}
@@ -598,6 +1209,38 @@ class AppState(QObject):
 
         self._thread: QThread | None = None
         self._worker: ResearchWorker | None = None
+        self._load_thread: QThread | None = None
+        self._load_worker: DatasetLoadWorker | None = None
+        self._full_process_thread: QThread | None = None
+        self._full_process_worker: FullDataProcessingWorker | None = None
+        self._feature_thread: QThread | None = None
+        self._feature_worker: FeatureGenerationWorker | None = None
+        self._pending_research_start = False
+        self._source_total_rows = 0
+        self._loaded_rows = 0
+        self._feature_rows = 0
+        self._research_rows = 0
+        self._current_generation = 0
+        self._total_generations = 0
+        self._candidate_count = 0
+        self._evaluated_count = 0
+        self._survived_count = 0
+        self._rejected_count = 0
+        self._best_score = 0.0
+        self._generation_best_score = 0.0
+        self._best_strategy_template = "n/a"
+        self._source_timeframe_label = "n/a"
+        self._research_timeframe_label = "n/a"
+        self._executed_trade_count = -1
+        self._current_chunk = 0
+        self._total_chunks = 0
+        self._current_candidate = 0
+        self._total_candidates = 0
+        self._rows_processed_live = 0
+        self._active_template_name = "n/a"
+        self._startup_phase_text = "idle"
+        self._proposal_chunks_processed = 0
+        self._proposal_rows_accumulated = 0
         self._rank_tick = 0
         self._rank_tracker: dict[str, dict] = {}
         self._elite_pool: dict[str, dict] = {}
@@ -661,6 +1304,10 @@ class AppState(QObject):
     def modelStatus(self):
         return self._model_status
 
+    @Property(str, notify=aiStateChanged)
+    def aiState(self):
+        return str(self._ai_state)
+
     @Property(str, notify=datasetPathChanged)
     def datasetPath(self):
         return self._dataset_path
@@ -668,6 +1315,106 @@ class AppState(QObject):
     @Property(str, notify=stageTextChanged)
     def stageText(self):
         return self._stage_text
+
+    @Property(int, notify=currentGenerationChanged)
+    def currentGeneration(self):
+        return int(self._current_generation)
+
+    @Property(int, notify=totalGenerationsChanged)
+    def totalGenerations(self):
+        return int(self._total_generations)
+
+    @Property(int, notify=candidateCountChanged)
+    def candidateCount(self):
+        return int(self._candidate_count)
+
+    @Property(int, notify=evaluatedCountChanged)
+    def evaluatedCount(self):
+        return int(self._evaluated_count)
+
+    @Property(int, notify=survivedCountChanged)
+    def survivedCount(self):
+        return int(self._survived_count)
+
+    @Property(int, notify=rejectedCountChanged)
+    def rejectedCount(self):
+        return int(self._rejected_count)
+
+    @Property(float, notify=bestScoreChanged)
+    def bestScore(self):
+        return float(self._best_score)
+
+    @Property(float, notify=generationBestScoreChanged)
+    def generationBestScore(self):
+        return float(self._generation_best_score)
+
+    @Property(str, notify=bestStrategyTemplateChanged)
+    def bestStrategyTemplate(self):
+        return str(self._best_strategy_template or "n/a")
+
+    @Property(int, notify=rowCountsChanged)
+    def sourceTotalRows(self):
+        return int(self._source_total_rows)
+
+    @Property(int, notify=rowCountsChanged)
+    def loadedRows(self):
+        return int(self._loaded_rows)
+
+    @Property(int, notify=rowCountsChanged)
+    def featureRows(self):
+        return int(self._feature_rows)
+
+    @Property(int, notify=rowCountsChanged)
+    def researchRows(self):
+        return int(self._research_rows)
+
+    @Property(str, notify=researchMetaChanged)
+    def sourceTimeframeLabel(self):
+        return str(self._source_timeframe_label or "n/a")
+
+    @Property(str, notify=researchMetaChanged)
+    def researchTimeframeLabel(self):
+        return str(self._research_timeframe_label or "n/a")
+
+    @Property(int, notify=researchMetaChanged)
+    def executedTrades(self):
+        return int(self._executed_trade_count)
+
+    @Property(int, notify=liveTelemetryChanged)
+    def currentChunk(self):
+        return int(self._current_chunk)
+
+    @Property(int, notify=liveTelemetryChanged)
+    def totalChunks(self):
+        return int(self._total_chunks)
+
+    @Property(int, notify=liveTelemetryChanged)
+    def currentCandidate(self):
+        return int(self._current_candidate)
+
+    @Property(int, notify=liveTelemetryChanged)
+    def totalCandidates(self):
+        return int(self._total_candidates)
+
+    @Property(int, notify=liveTelemetryChanged)
+    def rowsProcessedLive(self):
+        return int(self._rows_processed_live)
+
+    @Property(str, notify=liveTelemetryChanged)
+    def activeTemplateName(self):
+        return str(self._active_template_name or "n/a")
+
+    @Property(str, notify=startupProgressChanged)
+    def startupPhaseText(self):
+        return str(self._startup_phase_text or "idle")
+
+    @Property(int, notify=startupProgressChanged)
+    def proposalChunksProcessed(self):
+        return int(self._proposal_chunks_processed)
+
+    @Property(int, notify=startupProgressChanged)
+    def proposalRowsAccumulated(self):
+        return int(self._proposal_rows_accumulated)
 
 
     @Property(str, notify=chartTimeframeChanged)
@@ -690,6 +1437,30 @@ class AppState(QObject):
                 path = path[1:]
             return path
         return unquote(value)
+
+    def _infer_timeframe_label(self, dataset_path: str) -> str:
+        name = Path(dataset_path or "").name.lower()
+        patterns = [
+            (r"(\d+)\s*(sec|secs|second|seconds)\b", "s"),
+            (r"(\d+)\s*(min|mins|minute|minutes)\b", "m"),
+            (r"(\d+)\s*(hour|hours|hr|hrs)\b", "h"),
+            (r"(\d+)\s*(day|days)\b", "d"),
+            (r"[_\-.](\d+)(s|m|h|d)\b", ""),
+            (r"\b(\d+)(s|m|h|d)\b", ""),
+        ]
+        for pattern, unit_override in patterns:
+            match = re.search(pattern, name)
+            if not match:
+                continue
+            number = match.group(1)
+            unit = unit_override or match.group(2)
+            unit_norm = str(unit).lower()
+            unit_norm = "s" if unit_norm.startswith("sec") else unit_norm
+            unit_norm = "m" if unit_norm.startswith("min") else unit_norm
+            unit_norm = "h" if unit_norm.startswith("h") else unit_norm
+            unit_norm = "d" if unit_norm.startswith("d") else unit_norm
+            return f"{number}{unit_norm}"
+        return "n/a"
 
     @Slot(str)
     def logUiEvent(self, message: str):
@@ -732,6 +1503,9 @@ class AppState(QObject):
     def setDatasetPath(self, dataset_path: str):
         normalized = self._normalize_dataset_path(dataset_path)
         self._dataset_path = normalized
+        self._source_timeframe_label = self._infer_timeframe_label(normalized) if normalized else "n/a"
+        self._research_timeframe_label = self._source_timeframe_label
+        self.researchMetaChanged.emit()
         self.datasetPathChanged.emit()
         if normalized:
             self._append_log("UI", f"Dataset path set: {normalized}")
@@ -757,81 +1531,76 @@ class AppState(QObject):
 
     @Slot()
     def loadDataset(self):
-        try:
-            if not self._dataset_path:
-                raise ValueError("No dataset selected")
-            self._append_log("INFO", f"Loading dataset from: {self._dataset_path}")
-            resources = ResourceController(self._max_ram_gb, self._cpu_throttle, log_cb=self._append_log, stage_cb=self._set_stage)
-            started_at = time.perf_counter()
+        if self._load_thread is not None:
+            self._append_log("WARN", "Dataset load already running")
+            return
+        if not self._dataset_path:
+            self._append_log("ERROR", "Dataset load failed: ValueError: No dataset selected")
+            return
 
-            def _progress(rows_loaded: int, total_rows: int, detail: str):
-                resources.cooperative_yield("Dataset load", max(1, rows_loaded), max(1, total_rows or rows_loaded), detail)
-                QGuiApplication.processEvents()
-                if rows_loaded % 200000 == 0:
-                    elapsed = max(1e-9, time.perf_counter() - started_at)
-                    self._append_log("INFO", f"dataset load progress: rows={rows_loaded:,} speed={int(rows_loaded/elapsed):,}/s")
+        self._load_thread = QThread()
+        self._load_worker = DatasetLoadWorker(
+            self._dataset_path,
+            max_ram_gb=self._max_ram_gb,
+            cpu_throttle=self._cpu_throttle,
+            dataset_row_limit=self.DATASET_LOAD_MAX_ROWS,
+        )
+        self._load_worker.moveToThread(self._load_thread)
+        self._load_thread.started.connect(self._load_worker.run)
+        self._load_worker.log.connect(self._append_log)
+        self._load_worker.stage.connect(self._set_stage)
+        self._load_worker.finished.connect(self._on_dataset_loaded)
+        self._load_worker.failed.connect(self._on_dataset_failed)
+        self._load_thread.start()
 
-            df, profile = load_market_file_minimal(
-                self._dataset_path,
-                progress_cb=_progress,
-                chunk_size=150_000,
-            )
-            self._base_df = df
-            self._profile = asdict(profile)
-            self._preview_columns = list(df.columns)
-            self._preview_rows = df.head(20).astype(str).to_dict("records")
-            self.previewColumnsChanged.emit()
-            self.previewRowsChanged.emit()
-            self.profileChanged.emit()
-            self._feature_df = None
-            self._feature_columns = []
-            self._feature_preview_rows = []
-            self._feature_row_count = 0
-            self._generated_feature_count = 0
-            self.featureMetaChanged.emit()
-            self._refresh_chart_data()
-            self._set_stage("Dataset loaded")
-            self._append_log("INFO", f"Dataset loaded successfully: rows={profile.rows:,} cols={len(profile.columns)}")
-            self._append_log("INFO", f"Columns: {', '.join(profile.columns)}")
-            self._append_log("INFO", f"Range: {profile.start} -> {profile.end} | synthetic={profile.synthetic_pct:.2f}%")
-        except Exception as exc:
-            self._append_log("ERROR", f"Dataset load failed: {type(exc).__name__}: {exc}")
+    @Slot()
+    def prepareFullDataProcessing(self):
+        if self._full_process_thread is not None:
+            self._append_log("WARN", "Full-data processing already running")
+            return
+        if not self._dataset_path:
+            self._append_log("ERROR", "Full-data processing failed: ValueError: No dataset selected")
+            return
+        self._append_log("INFO", f"Starting incremental full-data processing for: {self._dataset_path}")
+        self._append_log("INFO", f"Preview rows currently loaded: {len(self._base_df) if self._base_df is not None else 0:,}")
+
+        self._full_process_thread = QThread()
+        self._full_process_worker = FullDataProcessingWorker(self._dataset_path, chunk_size=150_000)
+        self._full_process_worker.moveToThread(self._full_process_thread)
+        self._full_process_thread.started.connect(self._full_process_worker.run)
+        self._full_process_worker.log.connect(self._append_log)
+        self._full_process_worker.stage.connect(self._set_stage)
+        self._full_process_worker.finished.connect(self._on_full_processing_finished)
+        self._full_process_worker.failed.connect(self._on_full_processing_failed)
+        self._full_process_thread.start()
 
 
 
     @Slot()
     def generateFeatures(self):
-        try:
-            if self._base_df is None:
-                raise ValueError("Load a dataset before generating features")
-            groups = [
-                "EMA", "SMA", "RSI", "MACD", "ATR", "BOLLINGER",
-                "VOLATILITY", "VOLUME_SPIKE", "BREAKOUT", "CANDLE_RATIOS",
-                "VWAP", "MOMENTUM", "ORDER_FLOW", "ZSCORE",
-            ]
-            self._append_log("INFO", "Generating features from loaded dataset")
-            resources = ResourceController(self._max_ram_gb, self._cpu_throttle, log_cb=self._append_log, stage_cb=self._set_stage)
+        if self._feature_thread is not None:
+            self._append_log("WARN", "Feature generation already running")
+            return
+        if self._base_df is None:
+            self._append_log("ERROR", "Feature generation failed: ValueError: Load a dataset before generating features")
+            return
 
-            def _feature_progress(idx: int, total: int, feature_name: str):
-                resources.cooperative_yield("Feature generation", idx, total, feature_name)
-                QGuiApplication.processEvents()
-
-            feature_df, generated_cols = generate_features(
-                self._base_df,
-                groups,
-                progress_cb=_feature_progress,
-                cooperative_cb=_feature_progress,
-            )
-            self._feature_df = feature_df
-            self._feature_columns = list(feature_df.columns)
-            self._feature_preview_rows = feature_df.head(20).astype(str).to_dict("records")
-            self._feature_row_count = int(len(feature_df))
-            self._generated_feature_count = int(len(generated_cols))
-            self.featureMetaChanged.emit()
-            self._append_log("INFO", f"Features generated: {len(generated_cols)} new columns, rows={len(feature_df):,}")
-            self._append_log("INFO", f"Feature columns: {', '.join(generated_cols[:30])}{' ...' if len(generated_cols) > 30 else ''}")
-        except Exception as exc:
-            self._append_log("ERROR", f"Feature generation failed: {type(exc).__name__}: {exc}")
+        self._feature_thread = QThread()
+        self._feature_worker = FeatureGenerationWorker(
+            self._base_df,
+            max_ram_gb=self._max_ram_gb,
+            cpu_throttle=self._cpu_throttle,
+            working_limit=self.FEATURE_WORKING_SET_MAX_ROWS,
+            source_total_rows=self._source_total_rows,
+            loaded_rows=max(self._loaded_rows, int(len(self._base_df))),
+        )
+        self._feature_worker.moveToThread(self._feature_thread)
+        self._feature_thread.started.connect(self._feature_worker.run)
+        self._feature_worker.log.connect(self._append_log)
+        self._feature_worker.stage.connect(self._set_stage)
+        self._feature_worker.finished.connect(self._on_features_generated)
+        self._feature_worker.failed.connect(self._on_features_failed)
+        self._feature_thread.start()
 
     @Slot()
     def clearDataset(self):
@@ -848,6 +1617,11 @@ class AppState(QObject):
         self._feature_preview_rows = []
         self._feature_row_count = 0
         self._generated_feature_count = 0
+        self._source_total_rows = 0
+        self._loaded_rows = 0
+        self._feature_rows = 0
+        self._research_rows = 0
+        self.rowCountsChanged.emit()
         self.previewRowsChanged.emit()
         self.previewColumnsChanged.emit()
         self.featureMetaChanged.emit()
@@ -911,6 +1685,7 @@ class AppState(QObject):
         if self._thread is not None:
             self._append_log("WARN", "Research already running")
             return
+        self._pending_research_start = False
         self._append_log("UI", "Start clicked")
         self._strategies = []
         self._selected_strategy = {}
@@ -926,6 +1701,41 @@ class AppState(QObject):
         self._elite_pool = {}
         self._strategy_perf_index = {}
         self._mutation_feedback = {}
+        self._current_generation = 0
+        self._total_generations = 0
+        self._candidate_count = 0
+        self._evaluated_count = 0
+        self._survived_count = 0
+        self._rejected_count = 0
+        self._best_score = 0.0
+        self._generation_best_score = 0.0
+        self._best_strategy_template = "n/a"
+        self._ai_state = "idle"
+        self._research_timeframe_label = self._source_timeframe_label or "n/a"
+        self._executed_trade_count = -1
+        self._current_chunk = 0
+        self._total_chunks = 0
+        self._current_candidate = 0
+        self._total_candidates = 0
+        self._rows_processed_live = 0
+        self._active_template_name = "n/a"
+        self._startup_phase_text = "idle"
+        self._proposal_chunks_processed = 0
+        self._proposal_rows_accumulated = 0
+        self.currentGenerationChanged.emit()
+        self.totalGenerationsChanged.emit()
+        self.candidateCountChanged.emit()
+        self.evaluatedCountChanged.emit()
+        self.survivedCountChanged.emit()
+        self.rejectedCountChanged.emit()
+        self.bestScoreChanged.emit()
+        self.generationBestScoreChanged.emit()
+        self.bestStrategyTemplateChanged.emit()
+        self.aiStateChanged.emit()
+        self.researchMetaChanged.emit()
+        self.liveTelemetryChanged.emit()
+        self.startupProgressChanged.emit()
+        self.rowCountsChanged.emit()
         self.strategiesChanged.emit()
         self.selectedStrategyChanged.emit()
         self.fitnessSeriesChanged.emit()
@@ -937,7 +1747,28 @@ class AppState(QObject):
         if self._base_df is None:
             self.loadDataset()
             if self._base_df is None:
+                self._pending_research_start = True
+                self._append_log("INFO", "Dataset loading started in background; research will start after load completes")
                 return
+
+        self._research_rows = int(len(self._base_df))
+        self.rowCountsChanged.emit()
+        research_full_data_mode = True
+        if research_full_data_mode:
+            self._append_log("INFO", "Research mode: full-data incremental mode (chunk-processing enabled)")
+        else:
+            self._append_log("INFO", "Research mode: preview subset mode")
+        self._append_log(
+            "INFO",
+            f"Research input working set: source_total_rows={self._source_total_rows if self._source_total_rows > 0 else 'n/a'} "
+            f"loaded_rows={self._loaded_rows:,} feature_rows={self._feature_rows:,} research_rows={self._research_rows:,} "
+            f"additional_slicing=no",
+        )
+        self._append_log(
+            "INFO",
+            f"Timeframe context: source_tf={self._source_timeframe_label} research_tf={self._research_timeframe_label}",
+        )
+        self._append_log("INFO", f"Working-set snapshot before research: {self._working_set_text()}")
 
         self._model_status = "running"
         self.modelStatusChanged.emit()
@@ -951,14 +1782,37 @@ class AppState(QObject):
             model_type="mlp",
             max_ram_gb=self._max_ram_gb,
             cpu_throttle=self._cpu_throttle,
+            input_df=None if research_full_data_mode else self._base_df,
+            input_profile={} if research_full_data_mode else self._profile,
+            full_data_mode=research_full_data_mode,
         )
         self._worker.moveToThread(self._thread)
 
         self._thread.started.connect(self._worker.run)
         self._worker.log.connect(self._append_log)
         self._worker.stage.connect(self._set_stage)
+        self._worker.currentGenerationChanged.connect(self._on_current_generation_changed)
+        self._worker.totalGenerationsChanged.connect(self._on_total_generations_changed)
+        self._worker.candidateCountChanged.connect(self._on_candidate_count_changed)
+        self._worker.evaluatedCountChanged.connect(self._on_evaluated_count_changed)
+        self._worker.survivedCountChanged.connect(self._on_survived_count_changed)
+        self._worker.rejectedCountChanged.connect(self._on_rejected_count_changed)
+        self._worker.bestScoreChanged.connect(self._on_best_score_changed)
+        self._worker.generationBestScoreChanged.connect(self._on_generation_best_score_changed)
+        self._worker.bestScoreProgressChanged.connect(self._on_best_score_progress_changed)
+        self._worker.bestStrategyChanged.connect(self._on_best_strategy_changed)
+        self._worker.currentChunkChanged.connect(self._on_current_chunk_changed)
+        self._worker.totalChunksChanged.connect(self._on_total_chunks_changed)
+        self._worker.currentCandidateChanged.connect(self._on_current_candidate_changed)
+        self._worker.totalCandidatesChanged.connect(self._on_total_candidates_changed)
+        self._worker.rowsProcessedChanged.connect(self._on_rows_processed_changed)
+        self._worker.activeTemplateChanged.connect(self._on_active_template_changed)
+        self._worker.startupPhaseChanged.connect(self._on_startup_phase_changed)
+        self._worker.proposalChunksProcessedChanged.connect(self._on_proposal_chunks_processed_changed)
+        self._worker.proposalRowsAccumulatedChanged.connect(self._on_proposal_rows_accumulated_changed)
         self._worker.strategy.connect(self._on_strategy)
         self._worker.ai_epoch.connect(self._on_ai_epoch)
+        self._worker.aiStateChanged.connect(self._on_ai_state_changed)
         self._worker.finished.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
 
@@ -1013,18 +1867,25 @@ class AppState(QObject):
     def _append_log(self, level: str, msg: str):
         from datetime import datetime, timezone
 
-        self._logs.append({
+        self._logs.insert(0, {
             "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
             "level": level,
             "msg": msg,
         })
-        self._logs = self._logs[-600:]
+        self._logs = self._logs[:600]
         self.logsChanged.emit()
 
     @Slot(str)
     def _set_stage(self, stage: str):
         self._stage_text = stage
         self.stageTextChanged.emit()
+
+    def _working_set_text(self) -> str:
+        src = f"{self._source_total_rows:,}" if self._source_total_rows > 0 else "n/a"
+        return (
+            f"source_total_rows={src} loaded_rows={int(self._loaded_rows):,} "
+            f"feature_rows={int(self._feature_rows):,} research_rows={int(self._research_rows):,}"
+        )
 
     def _compute_strategy_score(self, row: dict) -> float:
         pnl = float(row.get("pnl", 0.0) or 0.0)
@@ -1320,11 +2181,24 @@ class AppState(QObject):
         self.valLossSeriesChanged.emit()
         self.valAccuracySeriesChanged.emit()
 
+    @Slot(str)
+    def _on_ai_state_changed(self, state: str):
+        next_state = str(state or "idle").strip().lower()
+        if next_state not in {"idle", "training", "evaluating", "complete"}:
+            next_state = "idle"
+        if next_state == self._ai_state:
+            return
+        self._ai_state = next_state
+        self.aiStateChanged.emit()
+
     @Slot(object)
     def _on_finished(self, payload: object):
         data = dict(payload)
         self._model_status = "completed"
         self.modelStatusChanged.emit()
+        if self._ai_state != "complete":
+            self._ai_state = "complete"
+            self.aiStateChanged.emit()
         self._set_stage("Final results ready")
 
         self._profile = dict(data.get("profile", {}))
@@ -1332,8 +2206,10 @@ class AppState(QObject):
         self.previewRowsChanged.emit()
         self.previewColumnsChanged.emit()
 
-        self._fitness_series = list(data.get("fitness_series", []))
-        self.fitnessSeriesChanged.emit()
+        payload_fitness = list(data.get("fitness_series", []))
+        if not self._fitness_series and payload_fitness:
+            self._fitness_series = payload_fitness
+            self.fitnessSeriesChanged.emit()
 
         ai = dict(data.get("ai", {}))
         self._regime_counts = dict(ai.get("regime_counts", {}))
@@ -1343,6 +2219,17 @@ class AppState(QObject):
 
         self._append_log("INFO", "Research pipeline completed")
         self._append_log("INFO", f"Stability score={float(data.get('stability', 0.0)):.2f}")
+        full_data_cumulative = dict(data.get("full_data_cumulative", {}))
+        trades_value = full_data_cumulative.get("trades", None)
+        self._executed_trade_count = int(trades_value) if trades_value is not None else -1
+        self.researchMetaChanged.emit()
+        self._append_log(
+            "INFO",
+            f"Executed trades (cumulative full-data): {self._executed_trade_count if self._executed_trade_count >= 0 else 'n/a'}",
+        )
+        self._append_log("INFO", f"Working-set snapshot after research: {self._working_set_text()}")
+        self._startup_phase_text = "complete"
+        self.startupProgressChanged.emit()
 
         self._cleanup_worker()
 
@@ -1350,6 +2237,11 @@ class AppState(QObject):
     def _on_failed(self, message: str):
         self._model_status = "error"
         self.modelStatusChanged.emit()
+        if self._ai_state != "idle":
+            self._ai_state = "idle"
+            self.aiStateChanged.emit()
+        self._startup_phase_text = "failed"
+        self.startupProgressChanged.emit()
         self._set_stage("Failed")
         self._append_log("ERROR", message)
         self._cleanup_worker()
@@ -1365,12 +2257,230 @@ class AppState(QObject):
         self._worker = None
         self._thread = None
 
+    @Slot(int)
+    def _on_current_generation_changed(self, value: int):
+        self._current_generation = int(max(0, value))
+        self.currentGenerationChanged.emit()
+
+    @Slot(int)
+    def _on_total_generations_changed(self, value: int):
+        self._total_generations = int(max(0, value))
+        self.totalGenerationsChanged.emit()
+
+    @Slot(int)
+    def _on_candidate_count_changed(self, value: int):
+        self._candidate_count = int(max(0, value))
+        self.candidateCountChanged.emit()
+
+    @Slot(int)
+    def _on_evaluated_count_changed(self, value: int):
+        self._evaluated_count = int(max(0, value))
+        self.evaluatedCountChanged.emit()
+
+    @Slot(int)
+    def _on_survived_count_changed(self, value: int):
+        self._survived_count = int(max(0, value))
+        self.survivedCountChanged.emit()
+
+    @Slot(int)
+    def _on_rejected_count_changed(self, value: int):
+        self._rejected_count = int(max(0, value))
+        self.rejectedCountChanged.emit()
+
+    @Slot(float)
+    def _on_best_score_changed(self, value: float):
+        self._best_score = float(value)
+        self.bestScoreChanged.emit()
+
+    @Slot(float)
+    def _on_generation_best_score_changed(self, value: float):
+        self._generation_best_score = float(value)
+        self.generationBestScoreChanged.emit()
+
+    @Slot(float)
+    def _on_best_score_progress_changed(self, value: float):
+        score = float(value)
+        self._fitness_series.append(score)
+        if len(self._fitness_series) > 600:
+            self._fitness_series = self._fitness_series[-600:]
+        self.fitnessSeriesChanged.emit()
+
+    @Slot(str)
+    def _on_best_strategy_changed(self, value: str):
+        self._best_strategy_template = str(value or "n/a")
+        self.bestStrategyTemplateChanged.emit()
+
+    @Slot(int)
+    def _on_current_chunk_changed(self, value: int):
+        self._current_chunk = int(max(0, value))
+        self.liveTelemetryChanged.emit()
+
+    @Slot(int)
+    def _on_total_chunks_changed(self, value: int):
+        self._total_chunks = int(max(0, value))
+        self.liveTelemetryChanged.emit()
+
+    @Slot(int)
+    def _on_current_candidate_changed(self, value: int):
+        self._current_candidate = int(max(0, value))
+        self.liveTelemetryChanged.emit()
+
+    @Slot(int)
+    def _on_total_candidates_changed(self, value: int):
+        self._total_candidates = int(max(0, value))
+        self.liveTelemetryChanged.emit()
+
+    @Slot(int)
+    def _on_rows_processed_changed(self, value: int):
+        self._rows_processed_live = int(max(0, value))
+        self.liveTelemetryChanged.emit()
+
+    @Slot(str)
+    def _on_active_template_changed(self, value: str):
+        self._active_template_name = str(value or "n/a")
+        self.liveTelemetryChanged.emit()
+
+    @Slot(str)
+    def _on_startup_phase_changed(self, value: str):
+        self._startup_phase_text = str(value or "idle")
+        self.startupProgressChanged.emit()
+
+    @Slot(int)
+    def _on_proposal_chunks_processed_changed(self, value: int):
+        self._proposal_chunks_processed = int(max(0, value))
+        self.startupProgressChanged.emit()
+
+    @Slot(int)
+    def _on_proposal_rows_accumulated_changed(self, value: int):
+        self._proposal_rows_accumulated = int(max(0, value))
+        self.startupProgressChanged.emit()
+
+    @Slot(object, object)
+    def _on_dataset_loaded(self, df: object, profile: object):
+        data = df
+        profile_dict = dict(profile)
+        self._base_df = data
+        self._profile = profile_dict
+        self._source_total_rows = int(profile_dict.get("source_total_rows", 0) or 0)
+        self._loaded_rows = int(len(data))
+        self._feature_rows = 0
+        self._research_rows = 0
+        self.rowCountsChanged.emit()
+        self._preview_columns = list(data.columns)
+        self._preview_rows = data.head(20).astype(str).to_dict("records")
+        self.previewColumnsChanged.emit()
+        self.previewRowsChanged.emit()
+        self.profileChanged.emit()
+        self._feature_df = None
+        self._feature_columns = []
+        self._feature_preview_rows = []
+        self._feature_row_count = 0
+        self._generated_feature_count = 0
+        self.featureMetaChanged.emit()
+        self._refresh_chart_data()
+        self._set_stage("Dataset loaded")
+        self._append_log("INFO", f"Dataset loaded successfully: rows={int(profile_dict.get('rows', 0)):,} cols={len(profile_dict.get('columns', []))}")
+        self._append_log("INFO", f"Columns: {', '.join(profile_dict.get('columns', []))}")
+        self._append_log(
+            "INFO",
+            f"Range: {profile_dict.get('start')} -> {profile_dict.get('end')} | synthetic={float(profile_dict.get('synthetic_pct', 0.0)):.2f}%",
+        )
+        self._append_log("INFO", f"Working-set snapshot after dataset load: {self._working_set_text()}")
+        self._cleanup_load_worker()
+        if self._pending_research_start and self._thread is None:
+            self._pending_research_start = False
+            self.startResearch()
+
+    @Slot(str)
+    def _on_dataset_failed(self, message: str):
+        self._append_log("ERROR", f"Dataset load failed: {message}")
+        self._pending_research_start = False
+        self._cleanup_load_worker()
+
+    def _cleanup_load_worker(self):
+        if self._load_thread is not None:
+            self._load_thread.quit()
+            self._load_thread.wait(2000)
+        if self._load_worker is not None:
+            self._load_worker.deleteLater()
+        if self._load_thread is not None:
+            self._load_thread.deleteLater()
+        self._load_worker = None
+        self._load_thread = None
+
+    @Slot(object, object, int, int, bool)
+    def _on_features_generated(self, feature_df: object, generated_cols: object, total_rows: int, working_rows: int, use_slice: bool):
+        df = feature_df
+        cols = list(generated_cols)
+        self._feature_df = df
+        self._feature_columns = list(df.columns)
+        self._feature_preview_rows = df.head(20).astype(str).to_dict("records")
+        self._feature_row_count = int(len(df))
+        self._generated_feature_count = int(len(cols))
+        self._feature_rows = int(len(df))
+        self.rowCountsChanged.emit()
+        self.featureMetaChanged.emit()
+        self._append_log(
+            "INFO",
+            f"Feature generation completed: source_total_rows="
+            f"{self._source_total_rows if self._source_total_rows > 0 else 'n/a'} loaded_rows={self._loaded_rows:,} "
+            f"feature_rows={self._feature_rows:,} sliced={'yes' if use_slice else 'no'} generated={len(cols)}",
+        )
+        self._append_log("INFO", f"Feature columns: {', '.join(cols[:30])}{' ...' if len(cols) > 30 else ''}")
+        self._append_log("INFO", f"Working-set snapshot after feature generation: {self._working_set_text()}")
+        self._cleanup_feature_worker()
+
+    @Slot(str)
+    def _on_features_failed(self, message: str):
+        self._append_log("ERROR", f"Feature generation failed: {message}")
+        self._cleanup_feature_worker()
+
+    def _cleanup_feature_worker(self):
+        if self._feature_thread is not None:
+            self._feature_thread.quit()
+            self._feature_thread.wait(2000)
+        if self._feature_worker is not None:
+            self._feature_worker.deleteLater()
+        if self._feature_thread is not None:
+            self._feature_thread.deleteLater()
+        self._feature_worker = None
+        self._feature_thread = None
+
+    @Slot(object)
+    def _on_full_processing_finished(self, payload: object):
+        data = dict(payload)
+        self._append_log(
+            "INFO",
+            f"Incremental full-data processing summary: processed_rows={int(data.get('processed_rows', 0)):,} "
+            f"total_rows_estimate={int(data.get('total_rows_estimate', 0)) if int(data.get('total_rows_estimate', 0)) > 0 else 'n/a'} "
+            f"chunks={int(data.get('chunks', 0))}",
+        )
+        self._cleanup_full_process_worker()
+
+    @Slot(str)
+    def _on_full_processing_failed(self, message: str):
+        self._append_log("ERROR", f"Full-data processing failed: {message}")
+        self._cleanup_full_process_worker()
+
+    def _cleanup_full_process_worker(self):
+        if self._full_process_thread is not None:
+            self._full_process_thread.quit()
+            self._full_process_thread.wait(2000)
+        if self._full_process_worker is not None:
+            self._full_process_worker.deleteLater()
+        if self._full_process_thread is not None:
+            self._full_process_thread.deleteLater()
+        self._full_process_worker = None
+        self._full_process_thread = None
+
 
 def run_qml() -> int:
     app = QGuiApplication(sys.argv)
     engine = QQmlApplicationEngine()
 
     state = AppState()
+    state.setParent(app)
+    engine._app_state = state  # keep a strong reference for the full engine lifetime
     engine.rootContext().setContextProperty("appState", state)
     qml_path = Path(__file__).resolve().parents[1] / "qml" / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_path)))

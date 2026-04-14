@@ -29,6 +29,15 @@ Item {
             CheckBox { id: validatedOnly; text: "Validated only"; checked: false }
             Item { Layout.fillWidth: true }
         }
+        Label {
+            Layout.fillWidth: true
+            text: appState.strategies.length === 0
+                ? ("Evaluating candidates... best template: " + (appState.activeTemplateName && appState.activeTemplateName.length > 0 ? appState.activeTemplateName : "n/a")
+                   + " | evaluated: " + appState.evaluatedCount)
+                : ("Live status: active template " + (appState.activeTemplateName && appState.activeTemplateName.length > 0 ? appState.activeTemplateName : "n/a")
+                   + " | evaluated: " + appState.evaluatedCount)
+            color: "#9FB5D7"
+        }
 
         ScrollView {
             Layout.fillWidth: true
