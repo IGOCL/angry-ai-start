@@ -210,6 +210,7 @@ class ResearchWorker(QObject):
                     raise ValueError("No dataset selected. Enter a CSV/Parquet path in the top bar.")
                 if not Path(self.dataset_path).exists():
                     raise ValueError(f"Dataset not found: {self.dataset_path}")
+                full_data_chunk_size = 150_000
                 self.stage.emit("Full-data processing")
                 self.log.emit("INFO", "Full-data processing started")
                 processed_rows = 0
@@ -217,7 +218,7 @@ class ResearchWorker(QObject):
                 rolling_max_rows = 300_000
                 rolling_chunks = deque()
                 rolling_rows = 0
-                for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
+                for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=full_data_chunk_size), start=1):
                     if self._cancel:
                         return
                     chunk_count = chunk_idx
@@ -609,6 +610,63 @@ class ResearchWorker(QObject):
                 wf = pd.DataFrame()
             self.log.emit("INFO", f"validation completed: walk_forward_stability={stability:.2f}")
 
+            full_data_cumulative = None
+            if self.full_data_mode and self.dataset_path:
+                self.stage.emit("Full-data accumulation")
+                self.log.emit("INFO", "full-data accumulation started")
+                cumulative_rows = 0
+                cumulative_trades = 0
+                cumulative_wins = 0
+                cumulative_losses = 0
+                cumulative_pnl = 0.0
+                wf_full_parts = []
+                template_key = str(last_top["template_key"])
+                template_params = dict(last_top["params"])
+                for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=full_data_chunk_size), start=1):
+                    if self._cancel:
+                        return
+                    chunk_rows = int(len(chunk_df))
+                    cumulative_rows += chunk_rows
+                    chunk_featured_df, _ = generate_features(chunk_df, selected_features)
+                    chunk_wf, _ = walk_forward_validate(
+                        chunk_featured_df,
+                        template_key=template_key,
+                        params=template_params,
+                        folds=4,
+                    )
+                    chunk_wf = chunk_wf.copy()
+                    chunk_wf["chunk_index"] = int(chunk_idx)
+                    wf_full_parts.append(chunk_wf)
+                    chunk_trades_series = pd.to_numeric(chunk_wf.get("trades", 0), errors="coerce").fillna(0.0)
+                    chunk_returns_series = pd.to_numeric(chunk_wf.get("return_pct", 0), errors="coerce").fillna(0.0)
+                    chunk_trades = int(chunk_trades_series.sum())
+                    chunk_pnl = float(chunk_returns_series.sum())
+                    chunk_wins = int(chunk_trades_series[chunk_returns_series > 0].sum())
+                    chunk_losses = int(chunk_trades_series[chunk_returns_series < 0].sum())
+                    cumulative_trades += chunk_trades
+                    cumulative_wins += chunk_wins
+                    cumulative_losses += chunk_losses
+                    cumulative_pnl += chunk_pnl
+                    self.log.emit(
+                        "INFO",
+                        f"full-data accumulation chunk={chunk_idx} chunk_rows={chunk_rows:,} "
+                        f"rows_processed={cumulative_rows:,} cumulative_trades={cumulative_trades:,}",
+                    )
+                if wf_full_parts:
+                    wf = pd.concat(wf_full_parts, ignore_index=True)
+                full_data_cumulative = {
+                    "rows_processed": int(cumulative_rows),
+                    "trades": int(cumulative_trades),
+                    "wins": int(cumulative_wins),
+                    "losses": int(cumulative_losses),
+                    "pnl": float(cumulative_pnl),
+                }
+                self.log.emit(
+                    "INFO",
+                    f"full-data accumulation complete: rows_processed={cumulative_rows:,} "
+                    f"trades={cumulative_trades:,} wins={cumulative_wins:,} losses={cumulative_losses:,} pnl={cumulative_pnl:.4f}",
+                )
+
             self.stage.emit("AI analysis")
             self.log.emit("INFO", "AI analysis started")
 
@@ -642,6 +700,7 @@ class ResearchWorker(QObject):
                 "fitness_series": generation_fitness,
                 "wf_rows": wf.to_dict("records"),
                 "stability": float(stability),
+                "full_data_cumulative": dict(full_data_cumulative or {}),
                 "ai": {
                     "loss": ai.loss_curve,
                     "accuracy": ai.accuracy_curve,
@@ -1417,12 +1476,12 @@ class AppState(QObject):
     def _append_log(self, level: str, msg: str):
         from datetime import datetime, timezone
 
-        self._logs.append({
+        self._logs.insert(0, {
             "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
             "level": level,
             "msg": msg,
         })
-        self._logs = self._logs[-600:]
+        self._logs = self._logs[:600]
         self.logsChanged.emit()
 
     @Slot(str)
