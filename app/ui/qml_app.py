@@ -16,7 +16,7 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 
 from app.core.ai_engine import analyze_market_ai
-from app.core.data_loader import load_market_file_minimal
+from app.core.data_loader import load_market_file_minimal, iter_market_file_minimal_chunks
 from app.core.feature_engine import generate_features
 from app.core.strategy_engine import evolve_templates, walk_forward_validate, TEMPLATES
 from app.core.chart_adapter import build_candle_payload
@@ -661,6 +661,59 @@ class DatasetLoadWorker(QObject):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+class FullDataProcessingWorker(QObject):
+    log = Signal(str, str)
+    stage = Signal(str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, dataset_path: str, chunk_size: int = 150_000):
+        super().__init__()
+        self.dataset_path = dataset_path
+        self.chunk_size = max(10_000, int(chunk_size))
+
+    @Slot()
+    def run(self):
+        try:
+            if not self.dataset_path:
+                raise ValueError("No dataset selected")
+            if not Path(self.dataset_path).exists():
+                raise ValueError(f"Dataset not found: {self.dataset_path}")
+
+            self.stage.emit("Full-data processing")
+            self.log.emit("INFO", f"Full-data processing active: source_path={self.dataset_path}")
+            self.log.emit("INFO", f"Preview load remains bounded; full processing runs incrementally by chunks of {self.chunk_size:,} rows")
+
+            chunks = 0
+            processed_rows = 0
+            total_rows_estimate = 0
+            for _, meta in iter_market_file_minimal_chunks(self.dataset_path, chunk_size=self.chunk_size):
+                chunks += 1
+                processed_rows = int(meta.get("processed_rows", processed_rows))
+                total_rows_estimate = max(total_rows_estimate, int(meta.get("total_rows_estimate", 0) or 0))
+                self.log.emit(
+                    "INFO",
+                    f"full-data chunk progress: chunk={int(meta.get('chunk_index', chunks))}/"
+                    f"{int(meta.get('total_chunks', 0) or 0) if int(meta.get('total_chunks', 0) or 0) > 0 else 'n/a'} "
+                    f"chunk_rows={int(meta.get('chunk_rows', 0)):,} processed_rows={processed_rows:,}",
+                )
+
+            self.log.emit(
+                "INFO",
+                f"Full-data processing complete: processed_rows={processed_rows:,} "
+                f"total_rows_estimate={total_rows_estimate if total_rows_estimate > 0 else 'n/a'} chunks={chunks}",
+            )
+            self.finished.emit(
+                {
+                    "processed_rows": int(processed_rows),
+                    "total_rows_estimate": int(total_rows_estimate),
+                    "chunks": int(chunks),
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 class FeatureGenerationWorker(QObject):
     log = Signal(str, str)
     stage = Signal(str)
@@ -786,6 +839,8 @@ class AppState(QObject):
         self._worker: ResearchWorker | None = None
         self._load_thread: QThread | None = None
         self._load_worker: DatasetLoadWorker | None = None
+        self._full_process_thread: QThread | None = None
+        self._full_process_worker: FullDataProcessingWorker | None = None
         self._feature_thread: QThread | None = None
         self._feature_worker: FeatureGenerationWorker | None = None
         self._pending_research_start = False
@@ -1008,6 +1063,27 @@ class AppState(QObject):
         self._load_worker.finished.connect(self._on_dataset_loaded)
         self._load_worker.failed.connect(self._on_dataset_failed)
         self._load_thread.start()
+
+    @Slot()
+    def prepareFullDataProcessing(self):
+        if self._full_process_thread is not None:
+            self._append_log("WARN", "Full-data processing already running")
+            return
+        if not self._dataset_path:
+            self._append_log("ERROR", "Full-data processing failed: ValueError: No dataset selected")
+            return
+        self._append_log("INFO", f"Starting incremental full-data processing for: {self._dataset_path}")
+        self._append_log("INFO", f"Preview rows currently loaded: {len(self._base_df) if self._base_df is not None else 0:,}")
+
+        self._full_process_thread = QThread()
+        self._full_process_worker = FullDataProcessingWorker(self._dataset_path, chunk_size=150_000)
+        self._full_process_worker.moveToThread(self._full_process_thread)
+        self._full_process_thread.started.connect(self._full_process_worker.run)
+        self._full_process_worker.log.connect(self._append_log)
+        self._full_process_worker.stage.connect(self._set_stage)
+        self._full_process_worker.finished.connect(self._on_full_processing_finished)
+        self._full_process_worker.failed.connect(self._on_full_processing_failed)
+        self._full_process_thread.start()
 
 
 
@@ -1739,6 +1815,33 @@ class AppState(QObject):
             self._feature_thread.deleteLater()
         self._feature_worker = None
         self._feature_thread = None
+
+    @Slot(object)
+    def _on_full_processing_finished(self, payload: object):
+        data = dict(payload)
+        self._append_log(
+            "INFO",
+            f"Incremental full-data processing summary: processed_rows={int(data.get('processed_rows', 0)):,} "
+            f"total_rows_estimate={int(data.get('total_rows_estimate', 0)) if int(data.get('total_rows_estimate', 0)) > 0 else 'n/a'} "
+            f"chunks={int(data.get('chunks', 0))}",
+        )
+        self._cleanup_full_process_worker()
+
+    @Slot(str)
+    def _on_full_processing_failed(self, message: str):
+        self._append_log("ERROR", f"Full-data processing failed: {message}")
+        self._cleanup_full_process_worker()
+
+    def _cleanup_full_process_worker(self):
+        if self._full_process_thread is not None:
+            self._full_process_thread.quit()
+            self._full_process_thread.wait(2000)
+        if self._full_process_worker is not None:
+            self._full_process_worker.deleteLater()
+        if self._full_process_thread is not None:
+            self._full_process_thread.deleteLater()
+        self._full_process_worker = None
+        self._full_process_thread = None
 
 
 def run_qml() -> int:

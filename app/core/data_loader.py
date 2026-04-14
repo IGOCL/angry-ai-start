@@ -460,6 +460,65 @@ def load_market_file_minimal(
     return _normalize_loaded_dataframe(df, path)
 
 
+def iter_market_file_minimal_chunks(
+    path: str | Path,
+    chunk_size: int = 200_000,
+    cancel_cb: Callable[[], bool] | None = None,
+):
+    path = str(path)
+    suffix = Path(path).suffix.lower()
+
+    if suffix == ".csv":
+        raw_columns = _read_csv_header(path)
+        selected = _resolve_minimal_column_selection(raw_columns)
+        processed_rows = 0
+        for idx, chunk in enumerate(pd.read_csv(path, usecols=selected, chunksize=max(10_000, int(chunk_size))), start=1):
+            if cancel_cb is not None and cancel_cb():
+                raise RuntimeError("Full-data processing cancelled")
+            chunk = normalize_columns(chunk)
+            chunk = parse_timestamp_column(chunk)
+            chunk = convert_numeric_columns(chunk)
+            chunk, _ = normalize_ohlc_rows(chunk)
+            chunk = chunk.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+            processed_rows += len(chunk)
+            yield chunk, {
+                "chunk_index": idx,
+                "total_chunks": 0,
+                "chunk_rows": int(len(chunk)),
+                "processed_rows": int(processed_rows),
+                "total_rows_estimate": 0,
+            }
+        return
+
+    if suffix in PARQUET_EXTENSIONS:
+        raw_columns = _read_parquet_schema_names(path)
+        selected = _resolve_minimal_column_selection(raw_columns)
+        parquet_file = pq.ParquetFile(path)
+        processed_rows = 0
+        total_rows = int(parquet_file.metadata.num_rows) if parquet_file.metadata is not None else 0
+        for rg in range(parquet_file.num_row_groups):
+            if cancel_cb is not None and cancel_cb():
+                raise RuntimeError("Full-data processing cancelled")
+            table = parquet_file.read_row_group(rg, columns=selected)
+            chunk = table.to_pandas()
+            chunk = normalize_columns(chunk)
+            chunk = parse_timestamp_column(chunk)
+            chunk = convert_numeric_columns(chunk)
+            chunk, _ = normalize_ohlc_rows(chunk)
+            chunk = chunk.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+            processed_rows += len(chunk)
+            yield chunk, {
+                "chunk_index": rg + 1,
+                "total_chunks": int(parquet_file.num_row_groups),
+                "chunk_rows": int(len(chunk)),
+                "processed_rows": int(processed_rows),
+                "total_rows_estimate": int(total_rows),
+            }
+        return
+
+    raise ValueError("Unsupported file type. Use CSV or Parquet.")
+
+
 def profile_to_text(profile: DataProfile) -> str:
     lines = [
         f"Path: {profile.path}",
