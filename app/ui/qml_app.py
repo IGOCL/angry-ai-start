@@ -114,12 +114,16 @@ class ResearchWorker(QObject):
         model_type: str,
         max_ram_gb: float = 4.0,
         cpu_throttle: int = 0,
+        input_df: pd.DataFrame | None = None,
+        input_profile: dict | None = None,
     ):
         super().__init__()
         self.dataset_path = dataset_path
         self.generations = generations
         self.population_top_k = population_top_k
         self.model_type = model_type
+        self.input_df = input_df
+        self.input_profile = dict(input_profile or {})
         self._cancel = False
         self._resources = ResourceController(max_ram_gb, cpu_throttle, log_cb=self.log.emit, stage_cb=self.stage.emit)
 
@@ -190,28 +194,35 @@ class ResearchWorker(QObject):
     @Slot()
     def run(self):
         try:
-            if not self.dataset_path:
-                raise ValueError("No dataset selected. Enter a CSV/Parquet path in the top bar.")
-            if not Path(self.dataset_path).exists():
-                raise ValueError(f"Dataset not found: {self.dataset_path}")
+            if self.input_df is not None:
+                df = self.input_df
+                profile = self.input_profile
+                self.log.emit("INFO", f"dataset ready (preloaded): rows={len(df):,}")
+            else:
+                if not self.dataset_path:
+                    raise ValueError("No dataset selected. Enter a CSV/Parquet path in the top bar.")
+                if not Path(self.dataset_path).exists():
+                    raise ValueError(f"Dataset not found: {self.dataset_path}")
 
-            self.stage.emit("Dataset load")
-            self.log.emit("INFO", "dataset load started")
-            load_started_at = time.perf_counter()
+                self.stage.emit("Dataset load")
+                self.log.emit("INFO", "dataset load started")
+                load_started_at = time.perf_counter()
 
-            def _load_progress(rows_loaded: int, total_rows: int, detail: str):
-                self._resources.cooperative_yield("Dataset load", max(1, rows_loaded), max(1, total_rows or rows_loaded), detail)
-                if rows_loaded % 200000 == 0:
-                    elapsed = max(1e-9, time.perf_counter() - load_started_at)
-                    self.log.emit("INFO", f"dataset load progress: rows={rows_loaded:,} speed={int(rows_loaded/elapsed):,}/s")
+                def _load_progress(rows_loaded: int, total_rows: int, detail: str):
+                    self._resources.cooperative_yield("Dataset load", max(1, rows_loaded), max(1, total_rows or rows_loaded), detail)
+                    if rows_loaded % 200000 == 0:
+                        elapsed = max(1e-9, time.perf_counter() - load_started_at)
+                        self.log.emit("INFO", f"dataset load progress: rows={rows_loaded:,} speed={int(rows_loaded/elapsed):,}/s")
 
-            df, profile = load_market_file_minimal(
-                self.dataset_path,
-                progress_cb=_load_progress,
-                cancel_cb=lambda: self._cancel,
-                chunk_size=150_000,
-            )
-            self.log.emit("INFO", f"dataset ready: rows={len(df):,} synthetic={profile.synthetic_pct:.2f}%")
+                df, profile_obj = load_market_file_minimal(
+                    self.dataset_path,
+                    progress_cb=_load_progress,
+                    cancel_cb=lambda: self._cancel,
+                    chunk_size=150_000,
+                )
+                profile = asdict(profile_obj)
+            synthetic_pct = float(profile.get("synthetic_pct", 0.0)) if isinstance(profile, dict) else float(profile.synthetic_pct)
+            self.log.emit("INFO", f"dataset ready: rows={len(df):,} synthetic={synthetic_pct:.2f}%")
             if self._cancel:
                 return
 
@@ -535,7 +546,7 @@ class ResearchWorker(QObject):
 
             self.stage.emit("Finalizing results")
             payload = {
-                "profile": asdict(profile),
+                "profile": dict(profile) if isinstance(profile, dict) else asdict(profile),
                 "feature_count": len(generated_cols),
                 "fitness_series": generation_fitness,
                 "wf_rows": wf.to_dict("records"),
@@ -610,7 +621,10 @@ class DatasetLoadWorker(QObject):
                 f"bounded_applied={'yes' if observed_total_rows > self.dataset_row_limit else 'no'} "
                 f"policy=recent_tail_rows({self.dataset_row_limit:,})",
             )
-            self.finished.emit(df, asdict(profile))
+            profile_payload = asdict(profile)
+            profile_payload["source_total_rows"] = int(observed_total_rows or 0)
+            profile_payload["loaded_rows"] = int(len(df))
+            self.finished.emit(df, profile_payload)
         except Exception as exc:
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
@@ -621,10 +635,20 @@ class FeatureGenerationWorker(QObject):
     finished = Signal(object, object, int, int, bool)
     failed = Signal(str)
 
-    def __init__(self, base_df: pd.DataFrame, max_ram_gb: float, cpu_throttle: int, working_limit: int):
+    def __init__(
+        self,
+        base_df: pd.DataFrame,
+        max_ram_gb: float,
+        cpu_throttle: int,
+        working_limit: int,
+        source_total_rows: int,
+        loaded_rows: int,
+    ):
         super().__init__()
         self.base_df = base_df
         self.working_limit = int(max(1, working_limit))
+        self.source_total_rows = int(source_total_rows)
+        self.loaded_rows = int(loaded_rows)
         self._resources = ResourceController(max_ram_gb, cpu_throttle, log_cb=self.log.emit, stage_cb=self.stage.emit)
 
     @Slot()
@@ -641,7 +665,8 @@ class FeatureGenerationWorker(QObject):
             self.log.emit("INFO", "Generating features from loaded dataset")
             self.log.emit(
                 "INFO",
-                f"Feature working set: total_rows={total_rows:,} working_rows={len(working_df):,} "
+                f"Feature working set: source_total_rows={self.source_total_rows if self.source_total_rows > 0 else 'n/a'} "
+                f"loaded_rows={self.loaded_rows:,} feature_rows={len(working_df):,} "
                 f"limit={self.working_limit:,} sliced={'yes' if use_slice else 'no'}",
             )
 
@@ -725,6 +750,10 @@ class AppState(QObject):
         self._feature_thread: QThread | None = None
         self._feature_worker: FeatureGenerationWorker | None = None
         self._pending_research_start = False
+        self._source_total_rows = 0
+        self._loaded_rows = 0
+        self._feature_rows = 0
+        self._research_rows = 0
         self._rank_tick = 0
         self._rank_tracker: dict[str, dict] = {}
         self._elite_pool: dict[str, dict] = {}
@@ -923,6 +952,8 @@ class AppState(QObject):
             max_ram_gb=self._max_ram_gb,
             cpu_throttle=self._cpu_throttle,
             working_limit=self.FEATURE_WORKING_SET_MAX_ROWS,
+            source_total_rows=self._source_total_rows,
+            loaded_rows=max(self._loaded_rows, int(len(self._base_df))),
         )
         self._feature_worker.moveToThread(self._feature_thread)
         self._feature_thread.started.connect(self._feature_worker.run)
@@ -947,6 +978,10 @@ class AppState(QObject):
         self._feature_preview_rows = []
         self._feature_row_count = 0
         self._generated_feature_count = 0
+        self._source_total_rows = 0
+        self._loaded_rows = 0
+        self._feature_rows = 0
+        self._research_rows = 0
         self.previewRowsChanged.emit()
         self.previewColumnsChanged.emit()
         self.featureMetaChanged.emit()
@@ -1041,6 +1076,15 @@ class AppState(QObject):
                 self._append_log("INFO", "Dataset loading started in background; research will start after load completes")
                 return
 
+        self._research_rows = int(len(self._base_df))
+        self._append_log(
+            "INFO",
+            f"Research input working set: source_total_rows={self._source_total_rows if self._source_total_rows > 0 else 'n/a'} "
+            f"loaded_rows={self._loaded_rows:,} feature_rows={self._feature_rows:,} research_rows={self._research_rows:,} "
+            f"additional_slicing=no",
+        )
+        self._append_log("INFO", f"Working-set snapshot before research: {self._working_set_text()}")
+
         self._model_status = "running"
         self.modelStatusChanged.emit()
         self._set_stage("Preparing")
@@ -1053,6 +1097,8 @@ class AppState(QObject):
             model_type="mlp",
             max_ram_gb=self._max_ram_gb,
             cpu_throttle=self._cpu_throttle,
+            input_df=self._base_df,
+            input_profile=self._profile,
         )
         self._worker.moveToThread(self._thread)
 
@@ -1127,6 +1173,13 @@ class AppState(QObject):
     def _set_stage(self, stage: str):
         self._stage_text = stage
         self.stageTextChanged.emit()
+
+    def _working_set_text(self) -> str:
+        src = f"{self._source_total_rows:,}" if self._source_total_rows > 0 else "n/a"
+        return (
+            f"source_total_rows={src} loaded_rows={int(self._loaded_rows):,} "
+            f"feature_rows={int(self._feature_rows):,} research_rows={int(self._research_rows):,}"
+        )
 
     def _compute_strategy_score(self, row: dict) -> float:
         pnl = float(row.get("pnl", 0.0) or 0.0)
@@ -1445,6 +1498,7 @@ class AppState(QObject):
 
         self._append_log("INFO", "Research pipeline completed")
         self._append_log("INFO", f"Stability score={float(data.get('stability', 0.0)):.2f}")
+        self._append_log("INFO", f"Working-set snapshot after research: {self._working_set_text()}")
 
         self._cleanup_worker()
 
@@ -1473,6 +1527,10 @@ class AppState(QObject):
         profile_dict = dict(profile)
         self._base_df = data
         self._profile = profile_dict
+        self._source_total_rows = int(profile_dict.get("source_total_rows", 0) or 0)
+        self._loaded_rows = int(len(data))
+        self._feature_rows = 0
+        self._research_rows = 0
         self._preview_columns = list(data.columns)
         self._preview_rows = data.head(20).astype(str).to_dict("records")
         self.previewColumnsChanged.emit()
@@ -1492,6 +1550,7 @@ class AppState(QObject):
             "INFO",
             f"Range: {profile_dict.get('start')} -> {profile_dict.get('end')} | synthetic={float(profile_dict.get('synthetic_pct', 0.0)):.2f}%",
         )
+        self._append_log("INFO", f"Working-set snapshot after dataset load: {self._working_set_text()}")
         self._cleanup_load_worker()
         if self._pending_research_start and self._thread is None:
             self._pending_research_start = False
@@ -1523,13 +1582,16 @@ class AppState(QObject):
         self._feature_preview_rows = df.head(20).astype(str).to_dict("records")
         self._feature_row_count = int(len(df))
         self._generated_feature_count = int(len(cols))
+        self._feature_rows = int(len(df))
         self.featureMetaChanged.emit()
         self._append_log(
             "INFO",
-            f"Feature generation completed: total_rows={int(total_rows):,} working_rows={int(working_rows):,} "
-            f"sliced={'yes' if use_slice else 'no'} generated={len(cols)}",
+            f"Feature generation completed: source_total_rows="
+            f"{self._source_total_rows if self._source_total_rows > 0 else 'n/a'} loaded_rows={self._loaded_rows:,} "
+            f"feature_rows={self._feature_rows:,} sliced={'yes' if use_slice else 'no'} generated={len(cols)}",
         )
         self._append_log("INFO", f"Feature columns: {', '.join(cols[:30])}{' ...' if len(cols) > 30 else ''}")
+        self._append_log("INFO", f"Working-set snapshot after feature generation: {self._working_set_text()}")
         self._cleanup_feature_worker()
 
     @Slot(str)
