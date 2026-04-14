@@ -566,9 +566,10 @@ class DatasetLoadWorker(QObject):
     finished = Signal(object, object)
     failed = Signal(str)
 
-    def __init__(self, dataset_path: str, max_ram_gb: float, cpu_throttle: int):
+    def __init__(self, dataset_path: str, max_ram_gb: float, cpu_throttle: int, dataset_row_limit: int):
         super().__init__()
         self.dataset_path = dataset_path
+        self.dataset_row_limit = max(10_000, int(dataset_row_limit))
         self._resources = ResourceController(max_ram_gb, cpu_throttle, log_cb=self.log.emit, stage_cb=self.stage.emit)
 
     @Slot()
@@ -581,9 +582,16 @@ class DatasetLoadWorker(QObject):
 
             self.stage.emit("Dataset load")
             self.log.emit("INFO", f"Loading dataset from: {self.dataset_path}")
+            self.log.emit(
+                "INFO",
+                f"Dataset load policy: recent_rows_cap={self.dataset_row_limit:,} (bounded default)",
+            )
             started_at = time.perf_counter()
+            observed_total_rows = 0
 
             def _progress(rows_loaded: int, total_rows: int, detail: str):
+                nonlocal observed_total_rows
+                observed_total_rows = max(observed_total_rows, int(total_rows or 0), int(rows_loaded))
                 self._resources.cooperative_yield("Dataset load", max(1, rows_loaded), max(1, total_rows or rows_loaded), detail)
                 if rows_loaded % 200000 == 0:
                     elapsed = max(1e-9, time.perf_counter() - started_at)
@@ -593,6 +601,14 @@ class DatasetLoadWorker(QObject):
                 self.dataset_path,
                 progress_cb=_progress,
                 chunk_size=150_000,
+                tail_rows=self.dataset_row_limit,
+            )
+            self.log.emit(
+                "INFO",
+                f"Dataset load summary: source_path={self.dataset_path} total_scan_rows="
+                f"{observed_total_rows if observed_total_rows > 0 else 'n/a'} loaded_rows={len(df):,} "
+                f"bounded_applied={'yes' if observed_total_rows > self.dataset_row_limit else 'no'} "
+                f"policy=recent_tail_rows({self.dataset_row_limit:,})",
             )
             self.finished.emit(df, asdict(profile))
         except Exception as exc:
@@ -600,6 +616,7 @@ class DatasetLoadWorker(QObject):
 
 
 class AppState(QObject):
+    DATASET_LOAD_MAX_ROWS = 500_000
     FEATURE_WORKING_SET_MAX_ROWS = 250_000
 
     strategiesChanged = Signal()
@@ -833,6 +850,7 @@ class AppState(QObject):
             self._dataset_path,
             max_ram_gb=self._max_ram_gb,
             cpu_throttle=self._cpu_throttle,
+            dataset_row_limit=self.DATASET_LOAD_MAX_ROWS,
         )
         self._load_worker.moveToThread(self._load_thread)
         self._load_thread.started.connect(self._load_worker.run)
