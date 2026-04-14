@@ -829,8 +829,10 @@ def evolve_templates(
     df: pd.DataFrame,
     config: BacktestConfig | None = None,
     top_k: int = 8,
+    min_trades: int = 50,
     progress_cb=None,
     result_cb=None,
+    constraint_cb=None,
     seed_pool: list[dict[str, Any]] | None = None,
     max_variants: int = 500,
     exploration_strength: float = 0.0,
@@ -839,6 +841,7 @@ def evolve_templates(
     cooperative_cb=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     cfg = config or BacktestConfig()
+    min_trades = max(1, int(min_trades))
     all_rows: list[dict[str, Any]] = []
     rng = np.random.default_rng(42 + len(df) + top_k)
 
@@ -957,6 +960,17 @@ def evolve_templates(
             test = evaluated["test"].metrics
             perf_context = dict(evaluated.get("performance_context", {}))
             test_trades = evaluated["test"].trades
+            observed_trades = int(test.get("total_trades", 0))
+            if observed_trades < min_trades:
+                if constraint_cb is not None:
+                    try:
+                        constraint_cb(
+                            f"Strategy rejected: insufficient trades ({observed_trades} < {min_trades}) "
+                            f"strategy={t.name} template={t.key}"
+                        )
+                    except Exception:
+                        pass
+                continue
             avg_trade_return_pct = float(test_trades["return_pct"].mean()) if not test_trades.empty else 0.0
             max_win_pct = float(test_trades["return_pct"].max()) if not test_trades.empty else 0.0
             max_loss_pct = float(test_trades["return_pct"].min()) if not test_trades.empty else 0.0
