@@ -495,6 +495,7 @@ class ResearchWorker(QObject):
                         raise RuntimeError("No proposal candidates generated for full-data evolution")
                     self.startupPhaseChanged.emit("first candidate evaluation started")
                     self.log.emit("INFO", "first candidate evaluation started")
+                    ema_reset_logged = False
                     for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
                         if self._cancel:
                             return
@@ -520,6 +521,7 @@ class ResearchWorker(QObject):
                             losses = int((test_trades["net_pnl"] < 0).sum()) if not test_trades.empty else 0
                             entry_signals = int(signal_diag.get("total_entry_signals", 0))
                             filtered_signals = int(signal_diag.get("filtered_signals_estimate", 0))
+                            timeframe_label = str(signal_diag.get("timeframe_label", "n/a"))
                             sig = f"{tkey}|{json.dumps(params, sort_keys=True)}"
                             state = agg_rows.get(sig)
                             if state is None:
@@ -560,6 +562,31 @@ class ResearchWorker(QObject):
                                 self.log.emit(
                                     "INFO",
                                     f"Chunk {chunk_idx}: cumulative_trades={state['trade_sum']:,} template={tkey}",
+                                )
+                            is_ema_20_50 = (
+                                tkey == "ema_cross_20_50"
+                                and int(params.get("ema_fast", 20)) == 20
+                                and int(params.get("ema_slow", 50)) == 50
+                            )
+                            if is_ema_20_50:
+                                tf_mode = "raw_1s_rows" if timeframe_label == "1s" else ("resampled_1m_bars" if timeframe_label == "1m" else "other_granularity")
+                                if not ema_reset_logged:
+                                    self.log.emit(
+                                        "INFO",
+                                        "EMA20/50 continuity: indicators recomputed per chunk=yes open_position_carry_across_chunks=no",
+                                    )
+                                    ema_reset_logged = True
+                                self.log.emit(
+                                    "INFO",
+                                    f"EMA20/50 timeframe usage: tf={timeframe_label} mode={tf_mode} source_rows={len(chunk_featured_df):,}",
+                                )
+                                self.log.emit(
+                                    "INFO",
+                                    f"EMA20/50 diag: tf={timeframe_label} rows={len(chunk_featured_df):,} "
+                                    f"long_cross={int(signal_diag.get('long_entry_signals', 0))} "
+                                    f"short_cross={int(signal_diag.get('short_entry_signals', 0))} "
+                                    f"total_signals={entry_signals} executed_trades={int(test.get('total_trades', 0))} "
+                                    f"blocked={filtered_signals} chunk_reset=yes position_reset=yes",
                                 )
                         self.log.emit(
                             "INFO",
