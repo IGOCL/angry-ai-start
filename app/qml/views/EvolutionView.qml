@@ -46,6 +46,7 @@ Item {
                     Label { text: "Source TF: " + (appState.sourceTimeframeLabel && appState.sourceTimeframeLabel.length > 0 ? appState.sourceTimeframeLabel : "n/a"); color: "#A1C7EB" }
                     Label { text: "Research TF: " + (appState.researchTimeframeLabel && appState.researchTimeframeLabel.length > 0 ? appState.researchTimeframeLabel : "n/a"); color: "#A1C7EB" }
                     Label { text: "Executed Trades: " + (appState.executedTrades >= 0 ? appState.executedTrades : "n/a"); color: "#A1C7EB" }
+                    Label { text: "Best Strategy: " + (appState.bestStrategyTemplate && appState.bestStrategyTemplate.length > 0 ? appState.bestStrategyTemplate : "n/a"); color: "#8FD3FF" }
                     Label { text: "Best Score: " + Number(appState.bestScore).toFixed(2); color: "#8FD3FF"; font.bold: true }
                 }
             }

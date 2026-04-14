@@ -115,6 +115,8 @@ class ResearchWorker(QObject):
     survivedCountChanged = Signal(int)
     rejectedCountChanged = Signal(int)
     bestScoreChanged = Signal(float)
+    bestScoreProgressChanged = Signal(float)
+    bestStrategyChanged = Signal(str)
     currentChunkChanged = Signal(int)
     totalChunksChanged = Signal(int)
     rowsProcessedChanged = Signal(int)
@@ -637,6 +639,8 @@ class ResearchWorker(QObject):
                     if candidate_score > best_score:
                         best_score = candidate_score
                         self.bestScoreChanged.emit(float(best_score))
+                        self.bestScoreProgressChanged.emit(float(best_score))
+                        self.bestStrategyChanged.emit(str(row.get("template_key", "n/a")))
                     params = dict(row["params"])
                     context = {
                         "ctx_high_vol_avg_return": row.get("ctx_high_vol_avg_return", 0.0),
@@ -1117,6 +1121,7 @@ class AppState(QObject):
     survivedCountChanged = Signal()
     rejectedCountChanged = Signal()
     bestScoreChanged = Signal()
+    bestStrategyTemplateChanged = Signal()
     rowCountsChanged = Signal()
     researchMetaChanged = Signal()
     liveTelemetryChanged = Signal()
@@ -1174,6 +1179,7 @@ class AppState(QObject):
         self._survived_count = 0
         self._rejected_count = 0
         self._best_score = 0.0
+        self._best_strategy_template = "n/a"
         self._source_timeframe_label = "n/a"
         self._research_timeframe_label = "n/a"
         self._executed_trade_count = -1
@@ -1285,6 +1291,10 @@ class AppState(QObject):
     @Property(float, notify=bestScoreChanged)
     def bestScore(self):
         return float(self._best_score)
+
+    @Property(str, notify=bestStrategyTemplateChanged)
+    def bestStrategyTemplate(self):
+        return str(self._best_strategy_template or "n/a")
 
     @Property(int, notify=rowCountsChanged)
     def sourceTotalRows(self):
@@ -1630,6 +1640,7 @@ class AppState(QObject):
         self._survived_count = 0
         self._rejected_count = 0
         self._best_score = 0.0
+        self._best_strategy_template = "n/a"
         self._ai_state = "idle"
         self._research_timeframe_label = self._source_timeframe_label or "n/a"
         self._executed_trade_count = -1
@@ -1646,6 +1657,7 @@ class AppState(QObject):
         self.survivedCountChanged.emit()
         self.rejectedCountChanged.emit()
         self.bestScoreChanged.emit()
+        self.bestStrategyTemplateChanged.emit()
         self.aiStateChanged.emit()
         self.researchMetaChanged.emit()
         self.liveTelemetryChanged.emit()
@@ -1712,6 +1724,8 @@ class AppState(QObject):
         self._worker.survivedCountChanged.connect(self._on_survived_count_changed)
         self._worker.rejectedCountChanged.connect(self._on_rejected_count_changed)
         self._worker.bestScoreChanged.connect(self._on_best_score_changed)
+        self._worker.bestScoreProgressChanged.connect(self._on_best_score_progress_changed)
+        self._worker.bestStrategyChanged.connect(self._on_best_strategy_changed)
         self._worker.currentChunkChanged.connect(self._on_current_chunk_changed)
         self._worker.totalChunksChanged.connect(self._on_total_chunks_changed)
         self._worker.currentCandidateChanged.connect(self._on_current_candidate_changed)
@@ -2114,8 +2128,10 @@ class AppState(QObject):
         self.previewRowsChanged.emit()
         self.previewColumnsChanged.emit()
 
-        self._fitness_series = list(data.get("fitness_series", []))
-        self.fitnessSeriesChanged.emit()
+        payload_fitness = list(data.get("fitness_series", []))
+        if not self._fitness_series and payload_fitness:
+            self._fitness_series = payload_fitness
+            self.fitnessSeriesChanged.emit()
 
         ai = dict(data.get("ai", {}))
         self._regime_counts = dict(ai.get("regime_counts", {}))
@@ -2193,6 +2209,19 @@ class AppState(QObject):
     def _on_best_score_changed(self, value: float):
         self._best_score = float(value)
         self.bestScoreChanged.emit()
+
+    @Slot(float)
+    def _on_best_score_progress_changed(self, value: float):
+        score = float(value)
+        self._fitness_series.append(score)
+        if len(self._fitness_series) > 600:
+            self._fitness_series = self._fitness_series[-600:]
+        self.fitnessSeriesChanged.emit()
+
+    @Slot(str)
+    def _on_best_strategy_changed(self, value: str):
+        self._best_strategy_template = str(value or "n/a")
+        self.bestStrategyTemplateChanged.emit()
 
     @Slot(int)
     def _on_current_chunk_changed(self, value: int):
