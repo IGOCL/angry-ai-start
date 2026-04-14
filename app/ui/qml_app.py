@@ -5,6 +5,7 @@ import hashlib
 import sys
 import time
 import logging
+import re
 from collections import deque
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -927,6 +928,7 @@ class AppState(QObject):
     rejectedCountChanged = Signal()
     bestScoreChanged = Signal()
     rowCountsChanged = Signal()
+    researchMetaChanged = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -981,6 +983,9 @@ class AppState(QObject):
         self._survived_count = 0
         self._rejected_count = 0
         self._best_score = 0.0
+        self._source_timeframe_label = "n/a"
+        self._research_timeframe_label = "n/a"
+        self._executed_trade_count = -1
         self._rank_tick = 0
         self._rank_tracker: dict[str, dict] = {}
         self._elite_pool: dict[str, dict] = {}
@@ -1100,6 +1105,18 @@ class AppState(QObject):
     def researchRows(self):
         return int(self._research_rows)
 
+    @Property(str, notify=researchMetaChanged)
+    def sourceTimeframeLabel(self):
+        return str(self._source_timeframe_label or "n/a")
+
+    @Property(str, notify=researchMetaChanged)
+    def researchTimeframeLabel(self):
+        return str(self._research_timeframe_label or "n/a")
+
+    @Property(int, notify=researchMetaChanged)
+    def executedTrades(self):
+        return int(self._executed_trade_count)
+
 
     @Property(str, notify=chartTimeframeChanged)
     def chartTimeframe(self):
@@ -1121,6 +1138,30 @@ class AppState(QObject):
                 path = path[1:]
             return path
         return unquote(value)
+
+    def _infer_timeframe_label(self, dataset_path: str) -> str:
+        name = Path(dataset_path or "").name.lower()
+        patterns = [
+            (r"(\d+)\s*(sec|secs|second|seconds)\b", "s"),
+            (r"(\d+)\s*(min|mins|minute|minutes)\b", "m"),
+            (r"(\d+)\s*(hour|hours|hr|hrs)\b", "h"),
+            (r"(\d+)\s*(day|days)\b", "d"),
+            (r"[_\-.](\d+)(s|m|h|d)\b", ""),
+            (r"\b(\d+)(s|m|h|d)\b", ""),
+        ]
+        for pattern, unit_override in patterns:
+            match = re.search(pattern, name)
+            if not match:
+                continue
+            number = match.group(1)
+            unit = unit_override or match.group(2)
+            unit_norm = str(unit).lower()
+            unit_norm = "s" if unit_norm.startswith("sec") else unit_norm
+            unit_norm = "m" if unit_norm.startswith("min") else unit_norm
+            unit_norm = "h" if unit_norm.startswith("h") else unit_norm
+            unit_norm = "d" if unit_norm.startswith("d") else unit_norm
+            return f"{number}{unit_norm}"
+        return "n/a"
 
     @Slot(str)
     def logUiEvent(self, message: str):
@@ -1163,6 +1204,9 @@ class AppState(QObject):
     def setDatasetPath(self, dataset_path: str):
         normalized = self._normalize_dataset_path(dataset_path)
         self._dataset_path = normalized
+        self._source_timeframe_label = self._infer_timeframe_label(normalized) if normalized else "n/a"
+        self._research_timeframe_label = self._source_timeframe_label
+        self.researchMetaChanged.emit()
         self.datasetPathChanged.emit()
         if normalized:
             self._append_log("UI", f"Dataset path set: {normalized}")
@@ -1366,6 +1410,8 @@ class AppState(QObject):
         self._rejected_count = 0
         self._best_score = 0.0
         self._ai_state = "idle"
+        self._research_timeframe_label = self._source_timeframe_label or "n/a"
+        self._executed_trade_count = -1
         self.currentGenerationChanged.emit()
         self.totalGenerationsChanged.emit()
         self.candidateCountChanged.emit()
@@ -1374,6 +1420,7 @@ class AppState(QObject):
         self.rejectedCountChanged.emit()
         self.bestScoreChanged.emit()
         self.aiStateChanged.emit()
+        self.researchMetaChanged.emit()
         self.rowCountsChanged.emit()
         self.strategiesChanged.emit()
         self.selectedStrategyChanged.emit()
@@ -1402,6 +1449,10 @@ class AppState(QObject):
             f"Research input working set: source_total_rows={self._source_total_rows if self._source_total_rows > 0 else 'n/a'} "
             f"loaded_rows={self._loaded_rows:,} feature_rows={self._feature_rows:,} research_rows={self._research_rows:,} "
             f"additional_slicing=no",
+        )
+        self._append_log(
+            "INFO",
+            f"Timeframe context: source_tf={self._source_timeframe_label} research_tf={self._research_timeframe_label}",
         )
         self._append_log("INFO", f"Working-set snapshot before research: {self._working_set_text()}")
 
@@ -1840,6 +1891,14 @@ class AppState(QObject):
 
         self._append_log("INFO", "Research pipeline completed")
         self._append_log("INFO", f"Stability score={float(data.get('stability', 0.0)):.2f}")
+        full_data_cumulative = dict(data.get("full_data_cumulative", {}))
+        trades_value = full_data_cumulative.get("trades", None)
+        self._executed_trade_count = int(trades_value) if trades_value is not None else -1
+        self.researchMetaChanged.emit()
+        self._append_log(
+            "INFO",
+            f"Executed trades (cumulative full-data): {self._executed_trade_count if self._executed_trade_count >= 0 else 'n/a'}",
+        )
         self._append_log("INFO", f"Working-set snapshot after research: {self._working_set_text()}")
 
         self._cleanup_worker()

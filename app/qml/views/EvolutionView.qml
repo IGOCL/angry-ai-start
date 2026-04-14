@@ -39,6 +39,9 @@ Item {
                     Label { text: "Loaded Rows: " + (appState.loadedRows > 0 ? appState.loadedRows : "n/a"); color: "#A1C7EB" }
                     Label { text: "Feature Rows: " + (appState.featureRows > 0 ? appState.featureRows : "n/a"); color: "#A1C7EB" }
                     Label { text: "Research Rows: " + (appState.researchRows > 0 ? appState.researchRows : "n/a"); color: "#A1C7EB" }
+                    Label { text: "Source TF: " + (appState.sourceTimeframeLabel && appState.sourceTimeframeLabel.length > 0 ? appState.sourceTimeframeLabel : "n/a"); color: "#A1C7EB" }
+                    Label { text: "Research TF: " + (appState.researchTimeframeLabel && appState.researchTimeframeLabel.length > 0 ? appState.researchTimeframeLabel : "n/a"); color: "#A1C7EB" }
+                    Label { text: "Executed Trades: " + (appState.executedTrades >= 0 ? appState.executedTrades : "n/a"); color: "#A1C7EB" }
                     Label { text: "Best Score: " + Number(appState.bestScore).toFixed(2); color: "#8FD3FF"; font.bold: true }
                 }
             }
