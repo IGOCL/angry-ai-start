@@ -1503,6 +1503,16 @@ class AppState(QObject):
     def logUiEvent(self, message: str):
         self._append_log("UI", message)
 
+    @Slot()
+    def copyAllLogsToClipboard(self):
+        lines: list[str] = []
+        for row in self._logs:
+            item = dict(row)
+            lines.append(f"[{item.get('ts', '')}][{item.get('level', '')}] {item.get('msg', '')}")
+        payload = "\n".join(lines)
+        QGuiApplication.clipboard().setText(payload)
+        self._append_log("INFO", f"Copied {len(self._logs)} log lines to clipboard")
+
 
     @Property(int, notify=chartWindowChanged)
     def chartWindowSize(self):
