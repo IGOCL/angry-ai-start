@@ -115,6 +115,7 @@ class ResearchWorker(QObject):
     survivedCountChanged = Signal(int)
     rejectedCountChanged = Signal(int)
     bestScoreChanged = Signal(float)
+    generationBestScoreChanged = Signal(float)
     bestScoreProgressChanged = Signal(float)
     bestStrategyChanged = Signal(str)
     currentChunkChanged = Signal(int)
@@ -358,6 +359,8 @@ class ResearchWorker(QObject):
 
             for gen in range(1, self.generations + 1):
                 self.currentGenerationChanged.emit(int(gen))
+                generation_best_score = float("-inf")
+                self.generationBestScoreChanged.emit(0.0)
                 if self._cancel:
                     return
                 self.stage.emit(f"Backtest generation {gen}/{self.generations}")
@@ -499,9 +502,12 @@ class ResearchWorker(QObject):
                             self.activeTemplateChanged.emit(str(tkey or "n/a"))
                             evaluated = evaluate_template(chunk_featured_df, tkey, params=params)
                             test = dict(evaluated["test"].metrics)
+                            signal_diag = dict(evaluated.get("signal_diagnostics", {}))
                             test_trades = evaluated["test"].trades
                             wins = int((test_trades["net_pnl"] > 0).sum()) if not test_trades.empty else 0
                             losses = int((test_trades["net_pnl"] < 0).sum()) if not test_trades.empty else 0
+                            entry_signals = int(signal_diag.get("total_entry_signals", 0))
+                            filtered_signals = int(signal_diag.get("filtered_signals_estimate", 0))
                             sig = f"{tkey}|{json.dumps(params, sort_keys=True)}"
                             state = agg_rows.get(sig)
                             if state is None:
@@ -519,6 +525,8 @@ class ResearchWorker(QObject):
                                     "trade_sum": 0,
                                     "wins_sum": 0,
                                     "loss_sum": 0,
+                                    "entry_signal_sum": 0,
+                                    "filtered_signal_sum": 0,
                                     "chunks": 0,
                                 }
                             state["robustness_sum"] += float(evaluated.get("robustness_score", 0.0))
@@ -527,8 +535,20 @@ class ResearchWorker(QObject):
                             state["trade_sum"] += int(test.get("total_trades", 0))
                             state["wins_sum"] += int(wins)
                             state["loss_sum"] += int(losses)
+                            state["entry_signal_sum"] += int(entry_signals)
+                            state["filtered_signal_sum"] += int(filtered_signals)
                             state["chunks"] += 1
                             agg_rows[sig] = state
+                            if cand_idx <= 2 and (chunk_idx == 1 or chunk_idx % 5 == 0):
+                                self.log.emit(
+                                    "INFO",
+                                    f"Candidate diag [{tkey}] chunk={chunk_idx} signals={entry_signals} "
+                                    f"trades={int(test.get('total_trades', 0))} wins={wins} losses={losses} filtered={filtered_signals}",
+                                )
+                                self.log.emit(
+                                    "INFO",
+                                    f"Chunk {chunk_idx}: cumulative_trades={state['trade_sum']:,} template={tkey}",
+                                )
                         self.log.emit(
                             "INFO",
                             f"full-data evolution chunk={chunk_idx} chunk_rows={chunk_rows:,} rows_processed={chunk_rows_processed:,}",
@@ -564,6 +584,8 @@ class ResearchWorker(QObject):
                             "test_max_loss_pct": 0.0,
                             "test_win_trades": wins_sum,
                             "test_loss_trades": loss_sum,
+                            "entry_signals": int(state["entry_signal_sum"]),
+                            "filtered_signals": int(state["filtered_signal_sum"]),
                             "ctx_high_vol_avg_return": 0.0,
                             "ctx_low_vol_avg_return": 0.0,
                             "ctx_trending_avg_return": 0.0,
@@ -599,6 +621,14 @@ class ResearchWorker(QObject):
                     )
                     all_variants = all_variants.sort_values("fitness", ascending=False).reset_index(drop=True)
                     top_variants = all_variants.head(max(1, int(self.population_top_k))).reset_index(drop=True)
+                    if not top_variants.empty:
+                        top_diag = top_variants.iloc[0]
+                        self.log.emit(
+                            "INFO",
+                            f"Trade metric consistency: total_trades={int(top_diag.get('test_trades', 0))} "
+                            f"(filter/display aligned) signals={int(top_diag.get('entry_signals', 0))} "
+                            f"filtered={int(top_diag.get('filtered_signals', 0))}",
+                        )
                     for streamed_idx, (_, streamed_row) in enumerate(top_variants.iterrows(), start=1):
                         _emit_streamed_variant(streamed_idx, len(top_variants), streamed_row.to_dict())
                     self.log.emit(
@@ -636,10 +666,12 @@ class ResearchWorker(QObject):
                     candidate_count += 1
                     evaluated_count += 1
                     candidate_score = float(row.get("fitness", 0.0))
+                    if candidate_score > generation_best_score:
+                        generation_best_score = candidate_score
+                        self.generationBestScoreChanged.emit(float(generation_best_score))
                     if candidate_score > best_score:
                         best_score = candidate_score
                         self.bestScoreChanged.emit(float(best_score))
-                        self.bestScoreProgressChanged.emit(float(best_score))
                         self.bestStrategyChanged.emit(str(row.get("template_key", "n/a")))
                     params = dict(row["params"])
                     context = {
@@ -719,6 +751,8 @@ class ResearchWorker(QObject):
                         }
                     )
                 seed_pool = next_seed_pool
+                if generation_best_score > float("-inf"):
+                    self.bestScoreProgressChanged.emit(float(generation_best_score))
                 self.log.emit("INFO", f"backtest completed: generation={gen} best_fitness={float(best['fitness']):.2f}")
 
             self.log.emit("INFO", f"strategy generation completed: total_candidates={strategy_counter}")
@@ -1121,6 +1155,7 @@ class AppState(QObject):
     survivedCountChanged = Signal()
     rejectedCountChanged = Signal()
     bestScoreChanged = Signal()
+    generationBestScoreChanged = Signal()
     bestStrategyTemplateChanged = Signal()
     rowCountsChanged = Signal()
     researchMetaChanged = Signal()
@@ -1179,6 +1214,7 @@ class AppState(QObject):
         self._survived_count = 0
         self._rejected_count = 0
         self._best_score = 0.0
+        self._generation_best_score = 0.0
         self._best_strategy_template = "n/a"
         self._source_timeframe_label = "n/a"
         self._research_timeframe_label = "n/a"
@@ -1291,6 +1327,10 @@ class AppState(QObject):
     @Property(float, notify=bestScoreChanged)
     def bestScore(self):
         return float(self._best_score)
+
+    @Property(float, notify=generationBestScoreChanged)
+    def generationBestScore(self):
+        return float(self._generation_best_score)
 
     @Property(str, notify=bestStrategyTemplateChanged)
     def bestStrategyTemplate(self):
@@ -1640,6 +1680,7 @@ class AppState(QObject):
         self._survived_count = 0
         self._rejected_count = 0
         self._best_score = 0.0
+        self._generation_best_score = 0.0
         self._best_strategy_template = "n/a"
         self._ai_state = "idle"
         self._research_timeframe_label = self._source_timeframe_label or "n/a"
@@ -1657,6 +1698,7 @@ class AppState(QObject):
         self.survivedCountChanged.emit()
         self.rejectedCountChanged.emit()
         self.bestScoreChanged.emit()
+        self.generationBestScoreChanged.emit()
         self.bestStrategyTemplateChanged.emit()
         self.aiStateChanged.emit()
         self.researchMetaChanged.emit()
@@ -1724,6 +1766,7 @@ class AppState(QObject):
         self._worker.survivedCountChanged.connect(self._on_survived_count_changed)
         self._worker.rejectedCountChanged.connect(self._on_rejected_count_changed)
         self._worker.bestScoreChanged.connect(self._on_best_score_changed)
+        self._worker.generationBestScoreChanged.connect(self._on_generation_best_score_changed)
         self._worker.bestScoreProgressChanged.connect(self._on_best_score_progress_changed)
         self._worker.bestStrategyChanged.connect(self._on_best_strategy_changed)
         self._worker.currentChunkChanged.connect(self._on_current_chunk_changed)
@@ -2209,6 +2252,11 @@ class AppState(QObject):
     def _on_best_score_changed(self, value: float):
         self._best_score = float(value)
         self.bestScoreChanged.emit()
+
+    @Slot(float)
+    def _on_generation_best_score_changed(self, value: float):
+        self._generation_best_score = float(value)
+        self.generationBestScoreChanged.emit()
 
     @Slot(float)
     def _on_best_score_progress_changed(self, value: float):
