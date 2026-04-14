@@ -140,6 +140,7 @@ class ResearchWorker(QObject):
         input_df: pd.DataFrame | None = None,
         input_profile: dict | None = None,
         full_data_mode: bool = False,
+        research_timeframe: str = "1s",
     ):
         super().__init__()
         self.dataset_path = dataset_path
@@ -149,6 +150,7 @@ class ResearchWorker(QObject):
         self.input_df = input_df
         self.input_profile = dict(input_profile or {})
         self.full_data_mode = bool(full_data_mode)
+        self.research_timeframe = str(research_timeframe or "1s")
         self._cancel = False
         self._resources = ResourceController(max_ram_gb, cpu_throttle, log_cb=self.log.emit, stage_cb=self.stage.emit)
 
@@ -215,6 +217,32 @@ class ResearchWorker(QObject):
             "summary": summary,
             "regime": regime,
         }
+
+    def _resample_for_research(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        tf = str(timeframe or "1s").lower()
+        rule_map = {"1m": "1min", "5m": "5min", "15m": "15min"}
+        rule = rule_map.get(tf)
+        if rule is None:
+            return df
+        if df is None or df.empty or "timestamp" not in df.columns:
+            return df
+        local = df.copy()
+        local["timestamp"] = pd.to_datetime(local["timestamp"], utc=True, errors="coerce")
+        local = local.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+        if local.empty:
+            return local
+        local = local.set_index("timestamp")
+        ohlcv = local.resample(rule).agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }
+        )
+        ohlcv = ohlcv.dropna(subset=["open", "high", "low", "close"]).reset_index()
+        return ohlcv
 
     @Slot()
     def run(self):
@@ -305,18 +333,19 @@ class ResearchWorker(QObject):
                 profile = asdict(profile_obj)
             synthetic_pct = float(profile.get("synthetic_pct", 0.0)) if isinstance(profile, dict) else float(profile.synthetic_pct)
             self.log.emit("INFO", f"dataset ready: rows={len(df):,} synthetic={synthetic_pct:.2f}%")
+            self.log.emit("INFO", f"Research timeframe selected: {self.research_timeframe}")
             if self._cancel:
                 return
 
-            if self.full_data_mode and self.dataset_path:
-                self.log.emit("INFO", "Full-data processing started")
-                processed_rows = 0
-                for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
-                    if self._cancel:
-                        return
-                    processed_rows += int(len(chunk_df))
-                    self.log.emit("INFO", f"Processing chunk {chunk_idx}, rows processed {processed_rows:,}")
-                self.log.emit("INFO", "Full-data processing complete")
+            eval_df = self._resample_for_research(df, self.research_timeframe)
+            if self.research_timeframe in {"1m", "5m", "15m"}:
+                self.log.emit(
+                    "INFO",
+                    f"Research timeframe: {self.research_timeframe} (resampled) rows={len(eval_df):,} source_rows={len(df):,}",
+                )
+            else:
+                self.log.emit("INFO", f"Research timeframe: {self.research_timeframe} (no resample) rows={len(eval_df):,}")
+            self.log.emit("INFO", "Evaluation path uses timeframe-adjusted dataframe for features/signals/backtesting")
 
             self.stage.emit("Feature generation")
             self.log.emit("INFO", "feature generation started")
@@ -327,7 +356,7 @@ class ResearchWorker(QObject):
                 self._resources.cooperative_yield("Feature generation", idx, total, feature_name)
 
             featured_df, generated_cols = generate_features(
-                df,
+                eval_df,
                 selected_features,
                 progress_cb=_feature_progress,
                 cooperative_cb=_feature_progress,
@@ -474,6 +503,7 @@ class ResearchWorker(QObject):
                     self.startupPhaseChanged.emit("proposal feature generation started")
                     self.log.emit("INFO", "proposal feature generation started")
                     proposal_df = pd.concat(proposal_frames, ignore_index=True)
+                    proposal_df = self._resample_for_research(proposal_df, self.research_timeframe)
                     proposal_featured_df, _ = generate_features(proposal_df, selected_features)
                     self.startupPhaseChanged.emit("proposal feature generation completed")
                     self.log.emit("INFO", "proposal feature generation completed")
@@ -520,8 +550,9 @@ class ResearchWorker(QObject):
                         chunk_rows = int(len(chunk_df))
                         chunk_rows_processed += chunk_rows
                         self.rowsProcessedChanged.emit(int(chunk_rows_processed))
-                        chunk_featured_df, _ = generate_features(chunk_df, selected_features)
-                        chunk_start_ts = pd.to_datetime(chunk_df.get("timestamp"), utc=True, errors="coerce").min() if "timestamp" in chunk_df.columns else None
+                        chunk_eval_df = self._resample_for_research(chunk_df, self.research_timeframe)
+                        chunk_featured_df, _ = generate_features(chunk_eval_df, selected_features)
+                        chunk_start_ts = pd.to_datetime(chunk_eval_df.get("timestamp"), utc=True, errors="coerce").min() if "timestamp" in chunk_eval_df.columns else None
                         warmup_rows_used = int(len(warmup_raw))
                         if warmup_rows_used > 0:
                             self.log.emit("INFO", f"chunk boundary warmup carry: chunk={chunk_idx} warmup_rows={warmup_rows_used:,} position_state_carried=yes")
@@ -538,7 +569,8 @@ class ResearchWorker(QObject):
                             evaluated = evaluate_template(chunk_featured_df, tkey, params=params)
                             test = dict(evaluated["test"].metrics)
                             signal_diag = dict(evaluated.get("signal_diagnostics", {}))
-                            continuity_input = pd.concat([warmup_raw, chunk_df], ignore_index=True) if warmup_rows_used > 0 else chunk_df
+                            continuity_input_raw = pd.concat([warmup_raw, chunk_df], ignore_index=True) if warmup_rows_used > 0 else chunk_df
+                            continuity_input = self._resample_for_research(continuity_input_raw, self.research_timeframe)
                             continuity_staged = build_strategy_dataframe(continuity_input, tkey, params=params)
                             continuity_result = run_backtest(continuity_staged, BacktestConfig())
                             continuity_trades = continuity_result.trades.copy()
@@ -1832,6 +1864,7 @@ class AppState(QObject):
                 return
 
         self._research_rows = int(len(self._base_df))
+        self._research_timeframe_label = str(self._chart_timeframe or "n/a")
         self.rowCountsChanged.emit()
         research_full_data_mode = True
         if research_full_data_mode:
@@ -1865,6 +1898,7 @@ class AppState(QObject):
             input_df=None if research_full_data_mode else self._base_df,
             input_profile={} if research_full_data_mode else self._profile,
             full_data_mode=research_full_data_mode,
+            research_timeframe=self._chart_timeframe,
         )
         self._worker.moveToThread(self._thread)
 
