@@ -21,6 +21,17 @@ Item {
             ChartPanel { Layout.fillWidth: true; Layout.fillHeight: true; title: "Val Accuracy"; series: appState.valAccuracySeries; lineColor: "#57C9A8" }
         }
 
+        Label {
+            Layout.fillWidth: true
+            text: "AI State: " + appState.aiState
+            color: "#D7EAFF"
+            font.bold: true
+        }
+        Label { Layout.fillWidth: true; text: "Generation: " + appState.currentGeneration + " / " + appState.totalGenerations; color: "#9BC2E6" }
+        Label { Layout.fillWidth: true; text: "Chunk: " + (appState.currentChunk > 0 ? appState.currentChunk : "n/a") + " / " + (appState.totalChunks > 0 ? appState.totalChunks : "n/a"); color: "#9BC2E6" }
+        Label { Layout.fillWidth: true; text: "Rows Processed: " + (appState.rowsProcessedLive > 0 ? appState.rowsProcessedLive : "n/a"); color: "#9BC2E6" }
+        Label { Layout.fillWidth: true; text: "Current Best Score: " + Number(appState.bestScore).toFixed(2); color: "#9BC2E6" }
+
         RowLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
