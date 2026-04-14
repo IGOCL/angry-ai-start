@@ -420,7 +420,9 @@ class ResearchWorker(QObject):
                 all_variants, top_variants = evolve_templates(
                     working_df,
                     top_k=self.population_top_k,
+                    min_trades=50,
                     result_cb=_emit_streamed_variant,
+                    constraint_cb=lambda message: self.log.emit("WARN", str(message)),
                     progress_cb=lambda idx, total, name: self._resources.cooperative_yield("Backtesting", idx, total, name),
                     seed_pool=seed_pool,
                     max_variants=180,
