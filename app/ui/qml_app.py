@@ -5,6 +5,7 @@ import hashlib
 import sys
 import time
 import logging
+from collections import deque
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from dataclasses import asdict
@@ -213,21 +214,45 @@ class ResearchWorker(QObject):
                 self.log.emit("INFO", "Full-data processing started")
                 processed_rows = 0
                 chunk_count = 0
-                df = None
+                rolling_max_rows = 300_000
+                rolling_chunks = deque()
+                rolling_rows = 0
                 for chunk_idx, chunk_df in enumerate(iterate_dataset_chunks(self.dataset_path, chunk_size=150_000), start=1):
                     if self._cancel:
                         return
                     chunk_count = chunk_idx
                     chunk_rows = int(len(chunk_df))
                     processed_rows += chunk_rows
-                    self.log.emit("INFO", f"Processing chunk {chunk_idx}, chunk rows {chunk_rows:,}, rows processed {processed_rows:,}")
-                    if df is None:
-                        df = chunk_df
-                if df is None:
+                    rolling_chunks.append(chunk_df)
+                    rolling_rows += chunk_rows
+                    while rolling_rows > rolling_max_rows and rolling_chunks:
+                        left_chunk = rolling_chunks.popleft()
+                        left_rows = int(len(left_chunk))
+                        excess_rows = rolling_rows - rolling_max_rows
+                        if excess_rows < left_rows:
+                            trimmed_chunk = left_chunk.iloc[excess_rows:].copy(deep=False)
+                            trimmed_rows = int(len(trimmed_chunk))
+                            rolling_chunks.appendleft(trimmed_chunk)
+                            rolling_rows -= (left_rows - trimmed_rows)
+                        else:
+                            rolling_rows -= left_rows
+                    self._resources.cooperative_yield(
+                        "Full-data processing",
+                        max(1, processed_rows),
+                        max(1, processed_rows),
+                        f"chunk={chunk_idx:,} rolling_rows={rolling_rows:,}",
+                    )
+                    self.log.emit(
+                        "INFO",
+                        f"Processing chunk {chunk_idx}, chunk rows {chunk_rows:,}, rows processed {processed_rows:,}, rolling working rows {rolling_rows:,}",
+                    )
+                if not rolling_chunks:
                     raise RuntimeError("Full-data processing produced no chunks")
+                df = pd.concat(list(rolling_chunks), ignore_index=True)
                 self.log.emit("INFO", "Full-data processing complete")
                 profile = {"synthetic_pct": float(pd.to_numeric(df.get("synthetic", 0), errors="coerce").fillna(0).mean() * 100.0) if "synthetic" in df.columns else 0.0}
                 self.log.emit("INFO", f"full-data incremental summary: chunks={chunk_count} rows_processed={processed_rows:,}")
+                self.log.emit("INFO", f"final research input rows {len(df):,}")
             elif self.input_df is not None:
                 self.log.emit("INFO", "Research branch: preview/preloaded mode")
                 df = self.input_df
